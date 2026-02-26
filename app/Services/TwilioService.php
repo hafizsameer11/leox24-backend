@@ -325,6 +325,13 @@ class TwilioService
         // Ensure numbers are in E.164 format and prefixed with "whatsapp:"
         $to = str_starts_with($to, 'whatsapp:') ? $to : 'whatsapp:' . $to;
         $from = str_starts_with($this->whatsAppNumber, 'whatsapp:') ? $this->whatsAppNumber : 'whatsapp:' . $this->whatsAppNumber;
+        Log::info('WHATSAPP FROM NUMBER USED', [
+            'raw_whatsapp_number' => $this->whatsAppNumber,
+            'final_from' => $from
+        ]);
+        Log::info('TWILIO SID USED', [
+            'sid' => config('services.twilio.account_sid')
+        ]);
 
         try {
             $params = [

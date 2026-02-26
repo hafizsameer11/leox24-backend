@@ -124,16 +124,29 @@ class MediaController extends Controller
 
             // Ensure directory exists and is writable
             if (!Storage::disk('public')->exists($mediaDir)) {
-                Storage::disk('public')->makeDirectory($mediaDir);
+                Storage::disk('public')->makeDirectory($mediaDir, 0755, true);
             }
+            
+            // Check if directory is writable, if not try to fix permissions
             if (!is_writable($fullPath)) {
-                Log::error('Media directory not writable', [
-                    'path' => $fullPath,
-                    'user_id' => $user->id,
-                ]);
-                return response()->json([
-                    'message' => 'Server storage directory is not writable. Please check permissions.',
-                ], 500);
+                // Try to make directory writable
+                @chmod($fullPath, 0755);
+                
+                // Check again after attempting to fix
+                if (!is_writable($fullPath)) {
+                    Log::error('Media directory not writable', [
+                        'path' => $fullPath,
+                        'user_id' => $user->id,
+                        'permissions' => substr(sprintf('%o', fileperms($fullPath)), -4),
+                        'owner' => posix_getpwuid(fileowner($fullPath))['name'] ?? 'unknown',
+                        'group' => posix_getgrgid(filegroup($fullPath))['name'] ?? 'unknown',
+                    ]);
+                    return response()->json([
+                        'message' => 'Server storage directory is not writable. Please check permissions. ' .
+                                    'Directory: ' . $fullPath . ' ' .
+                                    'Permissions: ' . substr(sprintf('%o', fileperms($fullPath)), -4),
+                    ], 500);
+                }
             }
 
             $path = $file->store($mediaDir, 'public');
