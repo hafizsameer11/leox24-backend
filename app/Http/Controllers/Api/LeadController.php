@@ -445,6 +445,7 @@ class LeadController extends Controller
     {
         $priorityFragments = [
             ['ragione sociale'],
+            ['insegna'],
             ['denominazione'],
             ['company', 'name'],
             ['company'],
@@ -505,6 +506,26 @@ class LeadController extends Controller
     }
 
     /**
+     * Prefer ';' when it yields more columns than ',' (common for EU / Italian CSV).
+     */
+    private function detectCsvDelimiter(string $firstLine): string
+    {
+        $firstLine = str_replace("\xEF\xBB\xBF", '', $firstLine);
+        $firstLine = rtrim($firstLine, "\r\n");
+        if ($firstLine === '') {
+            return ',';
+        }
+        $commaCols = count(str_getcsv($firstLine, ','));
+        $semiCols = count(str_getcsv($firstLine, ';'));
+
+        if ($semiCols > $commaCols && $semiCols > 1) {
+            return ';';
+        }
+
+        return ',';
+    }
+
+    /**
      * Parse the uploaded file based on format.
      */
     private function parseFile($file, $format)
@@ -516,27 +537,35 @@ class LeadController extends Controller
             $path = $file->getRealPath();
             $handle = fopen($path, 'r');
             if ($handle !== false) {
+                $firstLine = fgets($handle);
+                if ($firstLine === false) {
+                    fclose($handle);
+                    throw new \Exception('Unable to read CSV file');
+                }
+                $delimiter = $this->detectCsvDelimiter($firstLine);
+                rewind($handle);
+
                 // Get headers (first row)
-                $headers = fgetcsv($handle);
+                $headers = fgetcsv($handle, 0, $delimiter);
                 if ($headers === false) {
                     fclose($handle);
                     throw new \Exception('Unable to read headers from CSV file');
                 }
-                
+
                 // Clean headers - remove BOM, convert to UTF-8, and trim whitespace
-                $headers = array_map(function($header) {
+                $headers = array_map(function ($header) {
                     return $this->convertToUtf8($header);
                 }, $headers);
-                
+
                 // Get records
-                while (($row = fgetcsv($handle)) !== false) {
+                while (($row = fgetcsv($handle, 0, $delimiter)) !== false) {
                     // Only add if row has data
                     if (array_filter($row)) {
                         // Convert each cell to UTF-8
-                        $row = array_map(function($cell) {
+                        $row = array_map(function ($cell) {
                             return $this->convertToUtf8($cell);
                         }, $row);
-                        
+
                         // Ensure row has same number of columns as headers (pad or trim)
                         while (count($row) < count($headers)) {
                             $row[] = '';
