@@ -64,7 +64,28 @@ class LeadController extends Controller
         $leads = $query->orderBy('created_at', 'desc')
                       ->paginate($request->get('per_page', 15));
 
+        $this->trimEmbeddedFileRecordsForList($leads->getCollection());
+
         return response()->json($leads);
+    }
+
+    /**
+     * Cap embedded CSV/Excel rows on the list endpoint so JSON payloads and the SPA table
+     * stay responsive (full rows remain available on {@see show}).
+     */
+    private function trimEmbeddedFileRecordsForList(\Illuminate\Support\Collection $leads): void
+    {
+        $maxRows = 1500;
+        foreach ($leads as $lead) {
+            if (! $lead instanceof Lead) {
+                continue;
+            }
+            $records = $lead->file_records;
+            if (! is_array($records) || count($records) <= $maxRows) {
+                continue;
+            }
+            $lead->setAttribute('file_records', array_slice($records, 0, $maxRows));
+        }
     }
 
     /**
