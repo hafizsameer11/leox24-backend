@@ -39,6 +39,7 @@ class Lead extends Model
         'file_format',
         'file_headers',
         'file_records',
+        'raw_attributes',
         'value',
         'assigned_to',
     ];
@@ -46,6 +47,7 @@ class Lead extends Model
     protected $casts = [
         'file_headers' => 'array',
         'file_records' => 'array',
+        'raw_attributes' => 'array',
         'value' => 'decimal:2',
     ];
 
