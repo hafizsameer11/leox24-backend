@@ -25,6 +25,7 @@ use App\Http\Controllers\Api\EmailController;
 use App\Http\Controllers\Api\CategoryController;
 use App\Http\Controllers\Api\MediaController;
 use App\Http\Controllers\Api\SmsController;
+use App\Http\Controllers\Api\MyPetPlusLeadController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -67,6 +68,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::delete('/projects/{project}', [ProjectController::class, 'destroy']); // Super admin only
     Route::post('/projects/{project}/sso/redirect', [ProjectController::class, 'generateSSORedirect']);
     Route::get('/projects/{project}/iframe-callback', [ProjectController::class, 'iframeCallback']);
+    Route::get('/projects/{project}/mypetplus/leads', [MyPetPlusLeadController::class, 'index']);
 
     // TG Calabria Project
     Route::post('/projects/{projectId}/tg-calabria/login', [\App\Http\Controllers\Api\TGCalabriaController::class, 'login']);

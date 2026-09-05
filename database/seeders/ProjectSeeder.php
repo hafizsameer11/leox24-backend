@@ -52,6 +52,15 @@ class ProjectSeeder extends Seeder
                 'api_signup_endpoint' => '/api/v1/organizations',
                 'is_active' => true,
             ],
+            [
+                'name' => 'MyPet Plus',
+                'slug' => 'mypetplus',
+                'description' => 'Veterinary care platform',
+                'integration_type' => 'api',
+                'api_auth_type' => 'bearer',
+                'sso_enabled' => false,
+                'is_active' => true,
+            ],
         ];
 
         foreach ($projects as $project) {
