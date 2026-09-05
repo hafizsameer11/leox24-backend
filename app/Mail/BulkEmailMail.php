@@ -4,6 +4,7 @@ namespace App\Mail;
 
 use Illuminate\Bus\Queueable;
 use Illuminate\Mail\Mailable;
+use Illuminate\Mail\Mailables\Address;
 use Illuminate\Mail\Mailables\Attachment;
 use Illuminate\Mail\Mailables\Content;
 use Illuminate\Mail\Mailables\Envelope;
@@ -31,13 +32,30 @@ class BulkEmailMail extends Mailable
     private array $attachmentMeta;
 
     /**
+     * Sender address
+     */
+    private ?string $fromAddress;
+
+    /**
+     * Sender display name
+     */
+    private ?string $fromName;
+
+    /**
      * Create a new message instance.
      */
-    public function __construct(string $subject, string $message, array $attachments = [])
-    {
+    public function __construct(
+        string $subject,
+        string $message,
+        array $attachments = [],
+        ?string $fromAddress = null,
+        ?string $fromName = null
+    ) {
         $this->emailSubject = $subject;
         $this->emailMessage = $message;
         $this->attachmentMeta = $attachments;
+        $this->fromAddress = $fromAddress;
+        $this->fromName = $fromName;
     }
 
     /**
@@ -45,6 +63,16 @@ class BulkEmailMail extends Mailable
      */
     public function envelope(): Envelope
     {
+        if ($this->fromAddress) {
+            return new Envelope(
+                subject: $this->emailSubject,
+                from: new Address(
+                    $this->fromAddress,
+                    $this->fromName ?? $this->fromAddress
+                ),
+            );
+        }
+
         return new Envelope(
             subject: $this->emailSubject,
         );

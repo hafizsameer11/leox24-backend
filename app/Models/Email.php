@@ -11,6 +11,7 @@ class Email extends Model
 
     protected $fillable = [
         'category',
+        'email_address',
         'headers_json',
         'row_data_json',
         'status',
@@ -29,6 +30,10 @@ class Email extends Model
      */
     public function getEmailAddressAttribute(): ?string
     {
+        if (!empty($this->attributes['email_address'])) {
+            return $this->attributes['email_address'];
+        }
+
         $data = $this->row_data_json;
         if (is_array($data) && isset($data['email'])) {
             return $data['email'];

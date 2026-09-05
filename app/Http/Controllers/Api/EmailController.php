@@ -19,6 +19,56 @@ class EmailController extends Controller
     use HandlesApiErrors;
 
     /**
+     * List configured bulk email senders.
+     */
+    public function senders()
+    {
+        return response()->json([
+            'senders' => config('email_senders.senders', []),
+        ]);
+    }
+
+    /**
+     * Resolve sender config by id.
+     */
+    private function resolveSender(?string $senderId): array
+    {
+        $senders = config('email_senders.senders', []);
+        $default = $senders[count($senders) - 1] ?? [
+            'id' => 'default',
+            'address' => config('mail.from.address'),
+            'name' => config('mail.from.name'),
+        ];
+
+        if (!$senderId) {
+            return $default;
+        }
+
+        foreach ($senders as $sender) {
+            if (($sender['id'] ?? '') === $senderId) {
+                return $sender;
+            }
+        }
+
+        return $default;
+    }
+
+    /**
+     * Load existing email addresses (normalized) from database.
+     */
+    private function loadExistingEmailAddresses(): array
+    {
+        return Email::query()
+            ->whereNotNull('email_address')
+            ->pluck('email_address')
+            ->map(fn ($email) => strtolower(trim((string) $email)))
+            ->filter()
+            ->unique()
+            ->values()
+            ->all();
+    }
+
+    /**
      * List all emails with pagination and filtering
      */
     public function index(Request $request)
@@ -147,19 +197,9 @@ class EmailController extends Controller
             }
         }
 
-        // Batch check for existing emails - get all existing emails from database
-        $existingEmails = [];
-        if (!empty($allEmails)) {
-            // Get all emails from database and extract email addresses
-            $allEmailRecords = Email::select('row_data_json')->get();
-            foreach ($allEmailRecords as $emailRecord) {
-                $emailData = $emailRecord->row_data_json;
-                if (is_array($emailData) && isset($emailData['email'])) {
-                    $existingEmails[] = strtolower(trim($emailData['email']));
-                }
-            }
-            $existingEmails = array_unique($existingEmails);
-            }
+        // Batch check for existing emails
+        $existingEmails = $this->loadExistingEmailAddresses();
+        $seenInFile = [];
 
             // Process each record
         if ($hasHeaders) {
@@ -191,9 +231,9 @@ class EmailController extends Controller
                     continue;
                 }
 
-                // Check if email already exists (case-insensitive)
+                // Check if email already exists (DB or earlier row in same file)
                 $emailLower = strtolower($emailValue);
-                if (in_array($emailLower, $existingEmails)) {
+                if (in_array($emailLower, $existingEmails, true) || in_array($emailLower, $seenInFile, true)) {
                     $skipped++;
                     $skippedEmails[] = "Row " . ($rowIndex + 2) . ": Email already exists - " . $emailValue;
                     continue;
@@ -213,11 +253,14 @@ class EmailController extends Controller
                 try {
                     Email::create([
                         'category' => $category,
+                        'email_address' => $emailLower,
                         'headers_json' => $headers,
                         'row_data_json' => $rowData,
                         'status' => 'active',
                     ]);
                     $successful++;
+                    $existingEmails[] = $emailLower;
+                    $seenInFile[] = $emailLower;
                 } catch (\Exception $e) {
                     $failed++;
                     $errors[] = "Row " . ($rowIndex + 2) . ": " . $e->getMessage();
@@ -242,9 +285,9 @@ class EmailController extends Controller
                     continue;
                 }
 
-                // Check if email already exists (case-insensitive)
+                // Check if email already exists (DB or earlier row in same file)
                 $emailLower = strtolower($emailValue);
-                if (in_array($emailLower, $existingEmails)) {
+                if (in_array($emailLower, $existingEmails, true) || in_array($emailLower, $seenInFile, true)) {
                     $skipped++;
                     $skippedEmails[] = "Row " . ($rowIndex + 1) . ": Email already exists - " . $emailValue;
                     continue;
@@ -253,11 +296,14 @@ class EmailController extends Controller
                 try {
                     Email::create([
                         'category' => $category,
+                        'email_address' => $emailLower,
                         'headers_json' => null, // No headers
                         'row_data_json' => ['email' => $emailValue],
                         'status' => 'active',
                     ]);
                     $successful++;
+                    $existingEmails[] = $emailLower;
+                    $seenInFile[] = $emailLower;
                 } catch (\Exception $e) {
                     $failed++;
                     $errors[] = "Row " . ($rowIndex + 1) . ": " . $e->getMessage();
@@ -526,6 +572,7 @@ class EmailController extends Controller
         $validated = $request->validate([
             'subject' => 'required|string|max:255',
             'message' => 'required|string',
+            'sender_id' => 'nullable|string|max:100',
             'selection_type' => 'required|in:first_n,selected,category',
             'first_n' => 'required_if:selection_type,first_n|integer|min:1',
             'selected_ids' => 'required_if:selection_type,selected|array',
@@ -575,7 +622,16 @@ class EmailController extends Controller
                     break;
             }
 
-            $emails = $query->get();
+            $emails = $query->get()->unique(function (Email $email) {
+                $address = strtolower(trim((string) ($email->email_address ?? '')));
+                if ($address !== '') {
+                    return $address;
+                }
+                $data = $email->row_data_json;
+                return is_array($data) && isset($data['email'])
+                    ? strtolower(trim((string) $data['email']))
+                    : 'id:' . $email->id;
+            })->values();
 
             if ($emails->isEmpty()) {
                 return response()->json([
@@ -594,6 +650,10 @@ class EmailController extends Controller
                 );
             }
 
+            $sender = $this->resolveSender($validated['sender_id'] ?? null);
+            $fromAddress = $sender['address'] ?? config('mail.from.address');
+            $fromName = $sender['name'] ?? config('mail.from.name');
+
             // Dispatch job for each email (or batch them)
             foreach ($emails as $email) {
                 try {
@@ -602,7 +662,9 @@ class EmailController extends Controller
                         $validated['subject'],
                         $validated['message'],
                         $attachments,
-                        $batchId
+                        $batchId,
+                        $fromAddress,
+                        $fromName
                     );
                     $sentCount++;
                 } catch (\Exception $e) {

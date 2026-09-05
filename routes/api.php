@@ -24,6 +24,7 @@ use App\Http\Controllers\Api\UserController;
 use App\Http\Controllers\Api\EmailController;
 use App\Http\Controllers\Api\CategoryController;
 use App\Http\Controllers\Api\MediaController;
+use App\Http\Controllers\Api\SmsController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -95,9 +96,13 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/media/upload', [MediaController::class, 'upload']);
     
     // Email Bulk Management
+    Route::get('/emails/senders', [EmailController::class, 'senders']);
     Route::get('/emails', [EmailController::class, 'index']);
     Route::post('/emails/upload', [EmailController::class, 'upload']);
     Route::post('/emails/send', [EmailController::class, 'send']);
+
+    // Direct SMS (super admin)
+    Route::post('/sms/send', [SmsController::class, 'send']);
     
     // Follow-ups for customers
     Route::get('/customers/{customer}/follow-ups', [FollowUpController::class, 'index']);

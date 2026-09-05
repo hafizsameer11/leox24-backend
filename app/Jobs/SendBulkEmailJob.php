@@ -26,7 +26,9 @@ class SendBulkEmailJob implements ShouldQueue
         public string $subject,
         public string $message,
         public array $attachments = [],
-        public ?string $batchId = null
+        public ?string $batchId = null,
+        public ?string $fromAddress = null,
+        public ?string $fromName = null
     ) {}
 
     /**
@@ -68,7 +70,13 @@ class SendBulkEmailJob implements ShouldQueue
 
             // Send email using Laravel Mailable
             Mail::to($emailAddress)->send(
-                new BulkEmailMail($this->subject, $this->message, $this->attachments)
+                new BulkEmailMail(
+                    $this->subject,
+                    $this->message,
+                    $this->attachments,
+                    $this->fromAddress,
+                    $this->fromName
+                )
             );
 
             // Update status to sent
