@@ -84,6 +84,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Customers
     Route::apiResource('customers', CustomerController::class);
+    Route::post('/customers/{customer}/activities', [CustomerController::class, 'storeActivity']);
     Route::post('/customers/merge', [CustomerController::class, 'merge']);
 
     // Leads

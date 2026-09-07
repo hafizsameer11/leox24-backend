@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Http\Controllers\Api\Traits\HandlesApiErrors;
 use App\Models\Note;
+use App\Models\Customer;
 use App\Services\ActivityLogService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -63,7 +64,9 @@ class NoteController extends Controller
         ]);
 
         $user = $request->user();
-        $validated['company_id'] = $user->company_id;
+        $validated = $this->normalizeCustomerNoteable($validated, $user);
+        $validated['company_id'] = $validated['_customer_company_id'] ?? $user->company_id;
+        unset($validated['_customer_company_id']);
         $validated['user_id'] = $user->id;
         $validated['type'] = $validated['type'] ?? 'note';
 
@@ -74,6 +77,23 @@ class NoteController extends Controller
         });
 
         return response()->json($note->load(['user']), 201);
+    }
+
+    /** Accept the UI-safe Customer alias while storing Laravel's real morph class. */
+    private function normalizeCustomerNoteable(array $validated, $user): array
+    {
+        if (($validated['noteable_type'] ?? null) !== 'Customer') {
+            return $validated;
+        }
+
+        $customer = Customer::findOrFail($validated['noteable_id'] ?? 0);
+        if (!$user->isSuperAdmin() && $customer->company_id !== $user->company_id) {
+            abort(403, 'Access denied');
+        }
+
+        $validated['noteable_type'] = Customer::class;
+        $validated['_customer_company_id'] = $customer->company_id;
+        return $validated;
     }
 
     public function show(Note $note)

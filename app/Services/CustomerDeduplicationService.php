@@ -28,7 +28,9 @@ class CustomerDeduplicationService
 
             if ($existing) {
                 // Update existing customer if needed
-                $existing->update(array_merge($data, [
+                $updateData = $data;
+                unset($updateData['created_by']);
+                $existing->update(array_merge($updateData, [
                     'company_id' => $companyId ?? $existing->company_id,
                 ]));
                 return $existing;
@@ -69,9 +71,12 @@ class CustomerDeduplicationService
                 if (!$primary->vat && $customer->vat) {
                     $primary->vat = $customer->vat;
                 }
-                // Merge notes
-                if ($customer->notes) {
-                    $primary->notes = ($primary->notes ? $primary->notes . "\n\n" : '') . $customer->notes;
+                // `notes` is also the name of the polymorphic notes relation,
+                // so read the legacy customer-profile field explicitly.
+                $customerProfileNotes = $customer->getRawOriginal('notes');
+                if ($customerProfileNotes) {
+                    $primaryProfileNotes = $primary->getRawOriginal('notes');
+                    $primary->setAttribute('notes', ($primaryProfileNotes ? $primaryProfileNotes . "\n\n" : '') . $customerProfileNotes);
                 }
             }
 

@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Http\Controllers\Api\Traits\HandlesApiErrors;
 use App\Models\Task;
+use App\Models\Customer;
 use App\Services\ActivityLogService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -71,7 +72,9 @@ class TaskController extends Controller
         ]);
 
         $user = $request->user();
-        $validated['company_id'] = $user->company_id;
+        $validated = $this->normalizeCustomerTaskable($validated, $user);
+        $validated['company_id'] = $validated['_customer_company_id'] ?? $user->company_id;
+        unset($validated['_customer_company_id']);
         $validated['created_by'] = $user->id;
         $validated['status'] = $validated['status'] ?? 'pending';
 
@@ -82,6 +85,23 @@ class TaskController extends Controller
         });
 
         return response()->json($task->load(['assignee', 'creator']), 201);
+    }
+
+    /** Accept the UI-safe Customer alias while storing Laravel's real morph class. */
+    private function normalizeCustomerTaskable(array $validated, $user): array
+    {
+        if (($validated['taskable_type'] ?? null) !== 'Customer') {
+            return $validated;
+        }
+
+        $customer = Customer::findOrFail($validated['taskable_id'] ?? 0);
+        if (!$user->isSuperAdmin() && $customer->company_id !== $user->company_id) {
+            abort(403, 'Access denied');
+        }
+
+        $validated['taskable_type'] = Customer::class;
+        $validated['_customer_company_id'] = $customer->company_id;
+        return $validated;
     }
 
     public function show(Task $task)

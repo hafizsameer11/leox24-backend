@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Http\Controllers\Api\Traits\HandlesApiErrors;
 use App\Models\Document;
+use App\Models\Customer;
 use App\Services\ActivityLogService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
@@ -55,12 +56,15 @@ class DocumentController extends Controller
         ]);
 
         $user = $request->user();
+        $validated = $this->normalizeCustomerDocumentable($validated, $user);
+        $companyId = $validated['_customer_company_id'] ?? $user->company_id;
+        unset($validated['_customer_company_id']);
         $file = $request->file('file');
 
-        $path = $file->store('documents/' . $user->company_id, 'private');
+        $path = $file->store('documents/' . $companyId, 'private');
         
         $document = Document::create([
-            'company_id' => $user->company_id,
+            'company_id' => $companyId,
             'user_id' => $user->id,
             'documentable_type' => $validated['documentable_type'] ?? null,
             'documentable_id' => $validated['documentable_id'] ?? null,
@@ -79,6 +83,23 @@ class DocumentController extends Controller
         $this->activityLogService->logCreated($document);
 
         return response()->json($document->load(['user']), 201);
+    }
+
+    /** Accept the UI-safe Customer alias while storing Laravel's real morph class. */
+    private function normalizeCustomerDocumentable(array $validated, $user): array
+    {
+        if (($validated['documentable_type'] ?? null) !== 'Customer') {
+            return $validated;
+        }
+
+        $customer = Customer::findOrFail($validated['documentable_id'] ?? 0);
+        if (!$user->isSuperAdmin() && $customer->company_id !== $user->company_id) {
+            abort(403, 'Access denied');
+        }
+
+        $validated['documentable_type'] = Customer::class;
+        $validated['_customer_company_id'] = $customer->company_id;
+        return $validated;
     }
 
     public function show(Document $document)
