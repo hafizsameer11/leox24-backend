@@ -26,6 +26,7 @@ class Customer extends Model
 
     protected $fillable = [
         'company_id',
+        'category_id',
         'created_by',
         'email',
         'phone',
@@ -104,6 +105,12 @@ class Customer extends Model
     public function createdBy(): BelongsTo
     {
         return $this->belongsTo(User::class, 'created_by');
+    }
+
+    /** The existing CRM category selected for this customer. */
+    public function category(): BelongsTo
+    {
+        return $this->belongsTo(Category::class);
     }
 
     /**

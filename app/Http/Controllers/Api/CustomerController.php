@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Http\Controllers\Api\Traits\HandlesApiErrors;
 use App\Models\ActivityLog;
+use App\Models\Category;
 use App\Models\Customer;
 use App\Services\ActivityLogService;
 use App\Services\CustomerDeduplicationService;
@@ -23,7 +24,7 @@ class CustomerController extends Controller
     public function index(Request $request)
     {
         $user = $request->user();
-        $query = Customer::query();
+        $query = Customer::query()->with('category:id,name');
 
         if (!$user->isSuperAdmin()) {
             $query->where('company_id', $user->company_id);
@@ -58,6 +59,7 @@ class CustomerController extends Controller
             ? $request->company_id
             : $user->company_id;
 
+        $this->ensureCategoryAccess($validated['category_id'] ?? null, $companyId);
         $validated['created_by'] = $user->id;
         $validated['date_added'] = $validated['date_added'] ?? now()->toDateString();
         $customer = $this->deduplicationService->findOrCreateCustomer($validated, $companyId);
@@ -66,7 +68,7 @@ class CustomerController extends Controller
             $this->activityLogService->logCreated($customer);
         }
 
-        return response()->json($customer->load('createdBy:id,name,email'), 201);
+        return response()->json($customer->load(['createdBy:id,name,email', 'category:id,name,description']), 201);
     }
 
     public function show(Request $request, Customer $customer)
@@ -81,6 +83,7 @@ class CustomerController extends Controller
             'documents.user',
             'company',
             'createdBy:id,name,email',
+            'category:id,name,description',
         ]);
 
         $activityLogs = ActivityLog::where('model_type', Customer::class)
@@ -112,11 +115,12 @@ class CustomerController extends Controller
     {
         $this->ensureAccess($request, $customer);
         $validated = $request->validate($this->customerRules($customer));
+        $this->ensureCategoryAccess($validated['category_id'] ?? null, $customer->company_id);
         $oldValues = $customer->getAttributes();
         $customer->update($validated);
         $this->activityLogService->logUpdated($customer, $oldValues, $customer->getAttributes());
 
-        return response()->json($customer->fresh('createdBy:id,name,email'));
+        return response()->json($customer->fresh(['createdBy:id,name,email', 'category:id,name,description']));
     }
 
     public function destroy(Request $request, Customer $customer)
@@ -195,6 +199,7 @@ class CustomerController extends Controller
                 : ['sometimes', 'string', 'max:80', Rule::unique('customers', 'phone')->ignore($ignoreId)],
             'vat' => ['nullable', 'string', 'max:120', Rule::unique('customers', 'vat')->ignore($ignoreId)],
             'customer_code' => ['nullable', 'string', 'max:80', Rule::unique('customers', 'customer_code')->ignore($ignoreId)],
+            'category_id' => 'nullable|integer|exists:categories,id',
             'title' => 'nullable|string|max:30',
             'first_name' => 'nullable|string|max:120',
             'last_name' => 'nullable|string|max:120',
@@ -239,5 +244,19 @@ class CustomerController extends Controller
             'promotion' => 'nullable|string|max:255',
             'referred_by' => 'nullable|string|max:255',
         ];
+    }
+
+    /** Ensure a customer can only be assigned a category from the same CRM company. */
+    private function ensureCategoryAccess(?int $categoryId, mixed $companyId): void
+    {
+        if (!$categoryId) {
+            return;
+        }
+
+        $category = Category::withoutGlobalScopes()->findOrFail($categoryId);
+
+        if ((string) $category->company_id !== (string) $companyId) {
+            abort(422, 'The selected category is not available for this company.');
+        }
     }
 }
