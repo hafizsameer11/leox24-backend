@@ -5,12 +5,15 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Http\Controllers\Api\Traits\HandlesApiErrors;
 use App\Models\Lead;
+use App\Models\LeadImport;
+use App\Jobs\ProcessLeadImport;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\ValidationException;
 use PhpOffice\PhpSpreadsheet\IOFactory;
+use Illuminate\Support\Facades\Storage;
 
 class LeadController extends Controller
 {
@@ -258,80 +261,35 @@ class LeadController extends Controller
         $format = in_array($extension, ['csv', 'txt'], true) ? 'csv' : 'excel';
         $category = $request->input('category');
 
+        $storedPath = null;
         try {
-            $data = $this->parseFile($file, $format, $extension);
-
-            if (empty($data['headers']) || empty($data['records'])) {
-                return response()->json(['message' => 'File is empty or invalid format'], 400);
+            $storedPath = $file->store('lead-imports');
+            if (! $storedPath) {
+                throw new \RuntimeException('The uploaded spreadsheet could not be stored.');
             }
 
-            $headers = $data['headers'];
-            $records = $data['records'];
-            $assigned = (string) $user->id;
-            $now = now();
+            $import = LeadImport::create([
+                'user_id' => $user->id,
+                'company_id' => $companyId,
+                'file_name' => $fileName,
+                'stored_path' => $storedPath,
+                'file_format' => $format,
+                'category' => $category,
+                'status' => 'queued',
+            ]);
 
-            $importedCount = 0;
-            DB::transaction(function () use (
-                $records,
-                $headers,
-                $companyId,
-                $category,
-                $fileName,
-                $format,
-                $assigned,
-                $now,
-                &$importedCount
-            ) {
-                $insertRows = [];
-                foreach ($records as $row) {
-                    $mapped = $this->mapImportRowToLead($headers, $row);
-                    if ($mapped === null) {
-                        continue;
-                    }
-
-                    $insertRows[] = [
-                        'company_id' => $companyId,
-                        'name' => $mapped['name'],
-                        'email' => $mapped['email'],
-                        'phone' => $mapped['phone'],
-                        'source' => 'import:'.$fileName,
-                        'status' => 'cold',
-                        'category' => $category,
-                        'file_name' => $fileName,
-                        'file_format' => $format,
-                        'file_headers' => null,
-                        'file_records' => null,
-                        'raw_attributes' => json_encode($mapped['raw_attributes']),
-                        'value' => null,
-                        'assigned_to' => $assigned,
-                        'created_at' => $now,
-                        'updated_at' => $now,
-                    ];
-
-                    if (count($insertRows) >= 200) {
-                        Lead::query()->insert($insertRows);
-                        $importedCount += count($insertRows);
-                        $insertRows = [];
-                    }
-                }
-
-                if (! empty($insertRows)) {
-                    Lead::query()->insert($insertRows);
-                    $importedCount += count($insertRows);
-                }
-            });
-
-            if ($importedCount === 0) {
-                return response()->json(['message' => 'No data rows found in file (all rows empty).'], 400);
-            }
+            ProcessLeadImport::dispatch($import->id)->onConnection('database');
 
             return response()->json([
-                'message' => 'Import completed',
-                'imported_count' => $importedCount,
+                'message' => 'Import queued',
+                'import_id' => $import->id,
                 'file_name' => $fileName,
-            ], 201);
-
+                'status' => $import->status,
+            ], 202);
         } catch (\Throwable $e) {
+            if ($storedPath && Storage::exists($storedPath)) {
+                Storage::delete($storedPath);
+            }
             Log::error('Lead file upload failed', [
                 'file_name' => $fileName,
                 'extension' => $extension,
@@ -342,9 +300,156 @@ class LeadController extends Controller
             ]);
 
             return response()->json([
-                'message' => 'Failed to process the uploaded spreadsheet. Please verify that it is a valid CSV, XLS, or XLSX file.',
+                'message' => 'Failed to queue the uploaded spreadsheet. Please try again.',
             ], 422);
         }
+    }
+
+    /** Return the authenticated user's import status. */
+    public function importStatus(Request $request, LeadImport $leadImport)
+    {
+        $user = $request->user();
+        if (! $user->isSuperAdmin() && $leadImport->company_id !== $user->company_id) {
+            abort(403, 'Access denied');
+        }
+
+        return response()->json([
+            'id' => $leadImport->id,
+            'file_name' => $leadImport->file_name,
+            'status' => $leadImport->status,
+            'total_rows' => $leadImport->total_rows,
+            'processed_rows' => $leadImport->processed_rows,
+            'imported_count' => $leadImport->imported_count,
+            'error_count' => $leadImport->error_count,
+            'error_message' => $leadImport->error_message,
+            'started_at' => $leadImport->started_at,
+            'completed_at' => $leadImport->completed_at,
+        ]);
+    }
+
+    /** Process a queued import in a worker, outside the browser request. */
+    public function processQueuedImport(int $importId): void
+    {
+        $import = LeadImport::findOrFail($importId);
+        if (in_array($import->status, ['completed', 'failed'], true)) {
+            return;
+        }
+
+        // A worker may be restarted after a timeout while this import is still
+        // marked as processing. Remove only rows created by this import so a
+        // retry always starts from a clean, idempotent state.
+        Lead::where('lead_import_id', $import->id)->delete();
+
+        $import->update([
+            'status' => 'processing',
+            'started_at' => $import->started_at ?? now(),
+            'total_rows' => null,
+            'processed_rows' => 0,
+            'imported_count' => 0,
+            'error_count' => 0,
+            'error_message' => null,
+        ]);
+
+        try {
+            $absolutePath = Storage::path($import->stored_path);
+            if (! is_readable($absolutePath)) {
+                throw new \RuntimeException('The stored spreadsheet could not be read.');
+            }
+
+            $uploaded = new \Symfony\Component\HttpFoundation\File\UploadedFile(
+                $absolutePath,
+                $import->file_name,
+                null,
+                UPLOAD_ERR_OK,
+                true
+            );
+            $data = $this->parseFile($uploaded, $import->file_format, strtolower(pathinfo($import->file_name, PATHINFO_EXTENSION)));
+            $headers = $data['headers'] ?? [];
+            $records = $data['records'] ?? [];
+            $import->update(['total_rows' => count($records)]);
+
+            $processed = 0;
+            $imported = 0;
+            foreach (array_chunk($records, 200) as $recordChunk) {
+                $insertRows = [];
+                foreach ($recordChunk as $row) {
+                    $processed++;
+                    $mapped = $this->mapImportRowToLead($headers, $row);
+                    if ($mapped === null) {
+                        continue;
+                    }
+                    $insertRows[] = [
+                        'lead_import_id' => $import->id,
+                        'company_id' => $import->company_id,
+                        'name' => $mapped['name'],
+                        'email' => $mapped['email'],
+                        'phone' => $mapped['phone'],
+                        'source' => 'import:'.$import->file_name,
+                        'status' => 'cold',
+                        'category' => $import->category,
+                        'file_name' => $import->file_name,
+                        'file_format' => $import->file_format,
+                        'file_headers' => null,
+                        'file_records' => null,
+                        'raw_attributes' => json_encode($mapped['raw_attributes']),
+                        'value' => null,
+                        'assigned_to' => (string) $import->user_id,
+                        'created_at' => now(),
+                        'updated_at' => now(),
+                    ];
+                }
+                if ($insertRows !== []) {
+                    Lead::query()->insert($insertRows);
+                    $imported += count($insertRows);
+                }
+                $import->update([
+                    'processed_rows' => $processed,
+                    'imported_count' => $imported,
+                ]);
+            }
+
+            if ($imported === 0) {
+                throw new \RuntimeException('No data rows found in file (all rows empty).');
+            }
+
+            $import->update([
+                'status' => 'completed',
+                'processed_rows' => $processed,
+                'imported_count' => $imported,
+                'completed_at' => now(),
+            ]);
+        } catch (\Throwable $e) {
+            Lead::where('lead_import_id', $importId)->delete();
+            $this->markQueuedImportFailed($importId, $e);
+            throw $e;
+        } finally {
+            if (Storage::exists($import->stored_path)) {
+                Storage::delete($import->stored_path);
+            }
+        }
+    }
+
+    public function markQueuedImportFailed(int $importId, \Throwable $exception): void
+    {
+        $import = LeadImport::find($importId);
+        if (! $import) {
+            return;
+        }
+        Lead::where('lead_import_id', $importId)->delete();
+        $import->update([
+            'status' => 'failed',
+            'error_message' => $exception->getMessage(),
+            'completed_at' => now(),
+        ]);
+        if (Storage::exists($import->stored_path)) {
+            Storage::delete($import->stored_path);
+        }
+        Log::error('Lead import job failed', [
+            'import_id' => $importId,
+            'file_name' => $import->file_name,
+            'error' => $exception->getMessage(),
+            'exception' => get_class($exception),
+        ]);
     }
 
     /**

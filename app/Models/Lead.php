@@ -29,6 +29,7 @@ class Lead extends Model
 
     protected $fillable = [
         'company_id',
+        'lead_import_id',
         'name',
         'email',
         'phone',

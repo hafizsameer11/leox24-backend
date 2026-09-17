@@ -89,6 +89,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
     // Leads
     Route::get('/leads/export', [LeadController::class, 'export']);
+    Route::get('/leads/imports/{leadImport}', [LeadController::class, 'importStatus']);
     Route::apiResource('leads', LeadController::class);
     
     // Categories
