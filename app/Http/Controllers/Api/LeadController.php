@@ -259,7 +259,7 @@ class LeadController extends Controller
         $category = $request->input('category');
 
         try {
-            $data = $this->parseFile($file, $format);
+            $data = $this->parseFile($file, $format, $extension);
 
             if (empty($data['headers']) || empty($data['records'])) {
                 return response()->json(['message' => 'File is empty or invalid format'], 400);
@@ -270,46 +270,64 @@ class LeadController extends Controller
             $assigned = (string) $user->id;
             $now = now();
 
-            $insertRows = [];
-            foreach ($records as $row) {
-                $mapped = $this->mapImportRowToLead($headers, $row);
-                if ($mapped === null) {
-                    continue;
+            $importedCount = 0;
+            DB::transaction(function () use (
+                $records,
+                $headers,
+                $companyId,
+                $category,
+                $fileName,
+                $format,
+                $assigned,
+                $now,
+                &$importedCount
+            ) {
+                $insertRows = [];
+                foreach ($records as $row) {
+                    $mapped = $this->mapImportRowToLead($headers, $row);
+                    if ($mapped === null) {
+                        continue;
+                    }
+
+                    $insertRows[] = [
+                        'company_id' => $companyId,
+                        'name' => $mapped['name'],
+                        'email' => $mapped['email'],
+                        'phone' => $mapped['phone'],
+                        'source' => 'import:'.$fileName,
+                        'status' => 'cold',
+                        'category' => $category,
+                        'file_name' => $fileName,
+                        'file_format' => $format,
+                        'file_headers' => null,
+                        'file_records' => null,
+                        'raw_attributes' => json_encode($mapped['raw_attributes']),
+                        'value' => null,
+                        'assigned_to' => $assigned,
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ];
+
+                    if (count($insertRows) >= 200) {
+                        Lead::query()->insert($insertRows);
+                        $importedCount += count($insertRows);
+                        $insertRows = [];
+                    }
                 }
 
-                $insertRows[] = [
-                    'company_id' => $companyId,
-                    'name' => $mapped['name'],
-                    'email' => $mapped['email'],
-                    'phone' => $mapped['phone'],
-                    'source' => 'import:'.$fileName,
-                    'status' => 'cold',
-                    'category' => $category,
-                    'file_name' => $fileName,
-                    'file_format' => $format,
-                    'file_headers' => null,
-                    'file_records' => null,
-                    'raw_attributes' => json_encode($mapped['raw_attributes']),
-                    'value' => null,
-                    'assigned_to' => $assigned,
-                    'created_at' => $now,
-                    'updated_at' => $now,
-                ];
-            }
-
-            if (empty($insertRows)) {
-                return response()->json(['message' => 'No data rows found in file (all rows empty).'], 400);
-            }
-
-            DB::transaction(function () use ($insertRows) {
-                foreach (array_chunk($insertRows, 200) as $chunk) {
-                    Lead::query()->insert($chunk);
+                if (! empty($insertRows)) {
+                    Lead::query()->insert($insertRows);
+                    $importedCount += count($insertRows);
                 }
             });
 
+            if ($importedCount === 0) {
+                return response()->json(['message' => 'No data rows found in file (all rows empty).'], 400);
+            }
+
             return response()->json([
                 'message' => 'Import completed',
-                'imported_count' => count($insertRows),
+                'imported_count' => $importedCount,
                 'file_name' => $fileName,
             ], 201);
 
@@ -432,7 +450,25 @@ class LeadController extends Controller
 
     private function normalizeHeaderToken(string $header): string
     {
-        $h = mb_strtolower(trim($header));
+        $h = $this->convertToUtf8($header);
+        $h = str_replace(["\xC2\xA0", "\xE2\x80\xAF"], ' ', $h);
+        $h = mb_strtolower(trim($h));
+
+        // Match headers such as Città and Citta while preserving the original
+        // header label in raw_attributes.
+        if (class_exists(\Normalizer::class)) {
+            $normalized = \Normalizer::normalize($h, \Normalizer::FORM_D);
+            if (is_string($normalized)) {
+                $h = preg_replace('/\p{Mn}+/u', '', $normalized) ?? $h;
+            }
+        } else {
+            $transliterated = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $h);
+            if ($transliterated !== false) {
+                $h = $transliterated;
+            }
+        }
+
+        $h = str_replace(['_', '-', '/', '\\', '.', ':'], ' ', $h);
         $h = preg_replace('/\s+/u', ' ', $h) ?? $h;
 
         return $h;
@@ -440,10 +476,11 @@ class LeadController extends Controller
 
     private function headerLooksLikeEmail(string $norm): bool
     {
-        if (in_array($norm, ['mail', 'e-mail', 'email'], true)) {
+        $compact = str_replace(' ', '', $norm);
+        if (in_array($compact, ['mail', 'email'], true)) {
             return true;
         }
-        if (str_contains($norm, 'email') || str_contains($norm, 'e-mail')) {
+        if (str_contains($compact, 'email') || str_contains($compact, 'mail')) {
             return true;
         }
         if (str_contains($norm, 'pec')) {
@@ -455,7 +492,7 @@ class LeadController extends Controller
 
     private function headerLooksLikePhone(string $norm): bool
     {
-        foreach (['telefono', 'cellulare', 'mobile', 'phone', 'tel', 'fax', 'whatsapp'] as $token) {
+        foreach (['telefono', 'telefonino', 'cellulare', 'mobile', 'phone', 'tel', 'fax', 'whatsapp'] as $token) {
             if (str_contains($norm, $token)) {
                 return true;
             }
@@ -471,6 +508,24 @@ class LeadController extends Controller
      */
     private function pickNameFromRow(array $normPairs): string
     {
+        $firstName = '';
+        $lastName = '';
+        foreach ($normPairs as $pair) {
+            if ($pair['value'] === '') {
+                continue;
+            }
+            if ($this->isFirstNameHeader($pair['norm']) && $firstName === '') {
+                $firstName = $pair['value'];
+            }
+            if ($this->isLastNameHeader($pair['norm']) && $lastName === '') {
+                $lastName = $pair['value'];
+            }
+        }
+
+        if ($firstName !== '' || $lastName !== '') {
+            return trim($firstName.' '.$lastName);
+        }
+
         $priorityFragments = [
             ['ragione sociale'],
             ['insegna'],
@@ -486,10 +541,7 @@ class LeadController extends Controller
             ['nome', 'e', 'cognome'],
             ['first', 'name'],
             ['last', 'name'],
-            ['nome'],
-            ['cognome'],
             ['name'],
-            ['titolo'],
             ['contact'],
         ];
 
@@ -526,6 +578,19 @@ class LeadController extends Controller
         return '';
     }
 
+    private function isFirstNameHeader(string $norm): bool
+    {
+        return in_array($norm, ['nome', 'first name', 'firstname', 'given name'], true)
+            || str_contains($norm, 'first name');
+    }
+
+    private function isLastNameHeader(string $norm): bool
+    {
+        return in_array($norm, ['cognome', 'last name', 'lastname', 'surname', 'family name'], true)
+            || str_contains($norm, 'last name')
+            || str_contains($norm, 'surname');
+    }
+
     private function normalizePhone(string $value): string
     {
         $digits = preg_replace('/[^\d+]/', '', $value) ?? '';
@@ -556,7 +621,7 @@ class LeadController extends Controller
     /**
      * Parse the uploaded file based on format.
      */
-    private function parseFile($file, $format)
+    private function parseFile($file, $format, ?string $extension = null)
     {
         $headers = [];
         $records = [];
@@ -614,6 +679,11 @@ class LeadController extends Controller
                 $path = $file->getRealPath();
                 if (!$path || !is_readable($path)) {
                     throw new \RuntimeException('The uploaded file could not be read by the server.');
+                }
+
+                $extension = strtolower($extension ?: $file->getClientOriginalExtension());
+                if ($extension === 'xlsx') {
+                    return $this->parseXlsxStreaming($path);
                 }
 
                 // Normalize every Excel scalar to a string. Excel commonly
@@ -762,6 +832,210 @@ class LeadController extends Controller
             'headers' => $headers,
             'records' => $records
         ];
+    }
+
+    /**
+     * Parse modern XLSX files through their XML parts in one pass. This avoids
+     * reopening a large workbook once per row chunk, which can exceed a PHP
+     * request timeout even when the workbook itself is valid.
+     *
+     * @return array{headers: array<int, string>, records: array<int, array<int, string>>}
+     */
+    private function parseXlsxStreaming(string $path): array
+    {
+        $zip = new \ZipArchive();
+        if ($zip->open($path) !== true) {
+            throw new \RuntimeException('The XLSX container could not be opened.');
+        }
+
+        try {
+            $sharedStrings = $this->readXlsxSharedStrings($zip);
+            $sheetEntry = $this->findFirstXlsxWorksheetEntry($zip);
+            $sheetXml = $zip->getFromName($sheetEntry);
+            if ($sheetXml === false) {
+                throw new \RuntimeException('The XLSX worksheet could not be read.');
+            }
+
+            $reader = new \XMLReader();
+            if (! $reader->XML($sheetXml, null, LIBXML_NONET | LIBXML_COMPACT)) {
+                throw new \RuntimeException('The XLSX worksheet XML is invalid.');
+            }
+
+            $headers = [];
+            $records = [];
+            $maxColumns = 0;
+
+            while ($reader->read()) {
+                if ($reader->nodeType !== \XMLReader::ELEMENT || $reader->localName !== 'row') {
+                    continue;
+                }
+
+                $rowDepth = $reader->depth;
+                $row = [];
+
+                while ($reader->read()) {
+                    if ($reader->nodeType === \XMLReader::END_ELEMENT
+                        && $reader->localName === 'row'
+                        && $reader->depth === $rowDepth) {
+                        break;
+                    }
+
+                    if ($reader->nodeType !== \XMLReader::ELEMENT || $reader->localName !== 'c') {
+                        continue;
+                    }
+
+                    $cellDepth = $reader->depth;
+                    $cellReference = (string) $reader->getAttribute('r');
+                    $cellType = (string) $reader->getAttribute('t');
+                    $cellValue = '';
+
+                    if (! $reader->isEmptyElement) {
+                        while ($reader->read()) {
+                            if ($reader->nodeType === \XMLReader::END_ELEMENT
+                                && $reader->localName === 'c'
+                                && $reader->depth === $cellDepth) {
+                                break;
+                            }
+
+                            if ($reader->nodeType === \XMLReader::ELEMENT
+                                && ($reader->localName === 'v' || $reader->localName === 't')) {
+                                $cellValue .= $reader->readString();
+                            }
+                        }
+                    }
+
+                    if (! preg_match('/^([A-Z]+)/i', $cellReference, $matches)) {
+                        continue;
+                    }
+
+                    $columnIndex = $this->xlsxColumnIndex($matches[1]);
+                    if ($columnIndex < 0) {
+                        continue;
+                    }
+
+                    $cellValue = match ($cellType) {
+                        's' => isset($sharedStrings[(int) $cellValue]) ? $sharedStrings[(int) $cellValue] : '',
+                        'inlineStr' => $cellValue,
+                        'b' => $cellValue === '1' ? '1' : '0',
+                        default => $cellValue,
+                    };
+                    $row[$columnIndex] = $this->convertToUtf8($cellValue);
+                    $maxColumns = max($maxColumns, $columnIndex + 1);
+                }
+
+                $rowWidth = $row === [] ? 0 : (max(array_keys($row)) + 1);
+                $normalizedRow = array_fill(0, $rowWidth, '');
+                foreach ($row as $columnIndex => $value) {
+                    $normalizedRow[$columnIndex] = $value;
+                }
+                $row = $normalizedRow;
+
+                if ($headers === []) {
+                    $headers = $row;
+                    while (! empty($headers) && trim((string) end($headers)) === '') {
+                        array_pop($headers);
+                    }
+                    $maxColumns = count($headers);
+                    if ($maxColumns === 0) {
+                        throw new \RuntimeException('No headers found in XLSX file.');
+                    }
+                    continue;
+                }
+
+                $record = array_slice($row, 0, $maxColumns);
+                while (count($record) < $maxColumns) {
+                    $record[] = '';
+                }
+                if (array_filter($record, static fn ($value) => trim((string) $value) !== '')) {
+                    $records[] = $record;
+                }
+            }
+
+            $reader->close();
+
+            return ['headers' => $headers, 'records' => $records];
+        } finally {
+            $zip->close();
+        }
+    }
+
+    /** @return array<int, string> */
+    private function readXlsxSharedStrings(\ZipArchive $zip): array
+    {
+        $xml = $zip->getFromName('xl/sharedStrings.xml');
+        if ($xml === false || $xml === '') {
+            return [];
+        }
+
+        $root = simplexml_load_string($xml, \SimpleXMLElement::class, LIBXML_NONET | LIBXML_COMPACT);
+        if ($root === false) {
+            throw new \RuntimeException('The XLSX shared strings are invalid.');
+        }
+
+        $out = [];
+        $mainNamespace = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+        foreach ($root->children($mainNamespace)->si as $item) {
+            $value = '';
+            foreach ($item->children($mainNamespace) as $child) {
+                if ($child->getName() === 't') {
+                    $value .= (string) $child;
+                    continue;
+                }
+                if ($child->getName() !== 'r') {
+                    continue;
+                }
+                foreach ($child->children($mainNamespace)->t as $text) {
+                    $value .= (string) $text;
+                }
+            }
+            $out[] = $value;
+        }
+
+        return $out;
+    }
+
+    private function findFirstXlsxWorksheetEntry(\ZipArchive $zip): string
+    {
+        $workbookXml = $zip->getFromName('xl/workbook.xml');
+        $relationshipsXml = $zip->getFromName('xl/_rels/workbook.xml.rels');
+        if ($workbookXml === false || $relationshipsXml === false) {
+            throw new \RuntimeException('The XLSX workbook metadata is missing.');
+        }
+
+        $workbook = simplexml_load_string($workbookXml, \SimpleXMLElement::class, LIBXML_NONET | LIBXML_COMPACT);
+        $relationships = simplexml_load_string($relationshipsXml, \SimpleXMLElement::class, LIBXML_NONET | LIBXML_COMPACT);
+        if ($workbook === false || $relationships === false) {
+            throw new \RuntimeException('The XLSX workbook metadata is invalid.');
+        }
+
+        $workbook->registerXPathNamespace('x', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main');
+        $firstSheet = ($workbook->xpath('//x:sheets/x:sheet') ?: [])[0] ?? null;
+        if ($firstSheet === null) {
+            throw new \RuntimeException('The XLSX file contains no worksheets.');
+        }
+
+        $relationshipId = (string) ($firstSheet->attributes('r', true)->id ?? '');
+        foreach ($relationships->Relationship as $relationship) {
+            if ((string) $relationship['Id'] !== $relationshipId) {
+                continue;
+            }
+
+            $target = str_replace('\\', '/', (string) $relationship['Target']);
+            $target = ltrim($target, '/');
+            return str_starts_with($target, 'xl/') ? $target : 'xl/'.$target;
+        }
+
+        throw new \RuntimeException('The first XLSX worksheet relationship is missing.');
+    }
+
+    private function xlsxColumnIndex(string $letters): int
+    {
+        $index = 0;
+        foreach (str_split(strtoupper($letters)) as $letter) {
+            $index = ($index * 26) + (ord($letter) - 64);
+        }
+
+        return $index - 1;
     }
 
     /**
