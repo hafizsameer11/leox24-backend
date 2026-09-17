@@ -624,30 +624,38 @@ class LeadController extends Controller
                 $reader->setReadEmptyCells(false);
                 $spreadsheet = $reader->load($path);
                 $worksheet = $spreadsheet->getActiveSheet();
-                $highestRow = $worksheet->getHighestRow();
-                $highestColumn = $worksheet->getHighestColumn();
-                $highestColumnIndex = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($highestColumn);
+
+                // Use data bounds instead of formatted bounds. A workbook can
+                // contain styling far beyond the actual table (sometimes all
+                // the way to XFD/1,048,576); iterating that area can exhaust
+                // PHP-FPM memory and surface in the browser as a network error.
+                $highestRow = $worksheet->getHighestDataRow();
+                $highestColumn = $worksheet->getHighestDataColumn();
 
                 if ($highestRow < 1) {
                     throw new \Exception('Excel file is empty');
                 }
 
-                // Get headers (first row)
-                $headers = [];
-                for ($col = 1; $col <= $highestColumnIndex; $col++) {
-                    $columnLetter = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($col);
-                    $cell = $worksheet->getCell($columnLetter . '1');
-                    
-                    // Get calculated value (handles formulas automatically)
-                    $cellValue = $cell->getCalculatedValue();
-                    
-                    // Handle RichText
+                // Read only the actual data rectangle in one pass. This avoids
+                // creating millions of empty Cell objects for styled sheets.
+                $rows = $worksheet->rangeToArray(
+                    'A1:'.$highestColumn.$highestRow,
+                    null,
+                    true,
+                    false,
+                    false
+                );
+
+                $normalizeCell = function ($cellValue): string {
                     if ($cellValue instanceof \PhpOffice\PhpSpreadsheet\RichText\RichText) {
                         $cellValue = $cellValue->getPlainText();
                     }
-                    
-                    $headers[] = $this->convertToUtf8($cellValue ?? '');
-                }
+
+                    return $this->convertToUtf8($cellValue ?? '');
+                };
+
+                // Get headers (first row)
+                $headers = array_map($normalizeCell, $rows[0] ?? []);
 
                 // Remove empty trailing headers
                 while (!empty($headers) && empty(end($headers))) {
@@ -658,29 +666,21 @@ class LeadController extends Controller
                     throw new \Exception('No headers found in Excel file');
                 }
 
-                // Get records (starting from row 2)
-                for ($row = 2; $row <= $highestRow; $row++) {
-                    $record = [];
-                    for ($col = 1; $col <= count($headers); $col++) {
-                        $columnLetter = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($col);
-                        $cell = $worksheet->getCell($columnLetter . $row);
-                        
-                        // Get calculated value (handles formulas automatically)
-                        $cellValue = $cell->getCalculatedValue();
-                        
-                        // Handle RichText
-                        if ($cellValue instanceof \PhpOffice\PhpSpreadsheet\RichText\RichText) {
-                            $cellValue = $cellValue->getPlainText();
-                        }
-                        
-                        $record[] = $this->convertToUtf8($cellValue ?? '');
+                // Get records (starting from row 2), limited to the header width.
+                foreach (array_slice($rows, 1) as $row) {
+                    $record = array_map($normalizeCell, array_slice($row, 0, count($headers)));
+
+                    while (count($record) < count($headers)) {
+                        $record[] = '';
                     }
-                    
-                    // Only add if row has at least one non-empty value
-                    if (array_filter($record)) {
+
+                    // Only add if row has at least one non-empty value.
+                    if (array_filter($record, static fn ($value) => trim($value) !== '')) {
                         $records[] = $record;
                     }
                 }
+
+                unset($rows, $spreadsheet);
             } catch (\Throwable $e) {
                 throw new \Exception('Failed to parse Excel file: ' . $e->getMessage());
             }
