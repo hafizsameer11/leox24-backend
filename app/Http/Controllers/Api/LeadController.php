@@ -313,9 +313,19 @@ class LeadController extends Controller
                 'file_name' => $fileName,
             ], 201);
 
-        } catch (\Exception $e) {
-            Log::error('Lead file upload failed', ['error' => $e->getMessage()]);
-            return response()->json(['message' => 'Failed to process file: ' . $e->getMessage()], 500);
+        } catch (\Throwable $e) {
+            Log::error('Lead file upload failed', [
+                'file_name' => $fileName,
+                'extension' => $extension,
+                'mime_type' => $file->getMimeType(),
+                'size' => $file->getSize(),
+                'error' => $e->getMessage(),
+                'exception' => get_class($e),
+            ]);
+
+            return response()->json([
+                'message' => 'Failed to process the uploaded spreadsheet. Please verify that it is a valid CSV, XLS, or XLSX file.',
+            ], 422);
         }
     }
 
@@ -601,7 +611,18 @@ class LeadController extends Controller
         } else {
             // Excel format using PhpSpreadsheet
             try {
-                $spreadsheet = IOFactory::load($file->getRealPath());
+                $path = $file->getRealPath();
+                if (!$path || !is_readable($path)) {
+                    throw new \RuntimeException('The uploaded file could not be read by the server.');
+                }
+
+                // Let PhpSpreadsheet identify the actual legacy/new Excel
+                // reader and avoid loading formatting, images, and other
+                // workbook metadata that is unnecessary for lead imports.
+                $reader = IOFactory::createReaderForFile($path);
+                $reader->setReadDataOnly(true);
+                $reader->setReadEmptyCells(false);
+                $spreadsheet = $reader->load($path);
                 $worksheet = $spreadsheet->getActiveSheet();
                 $highestRow = $worksheet->getHighestRow();
                 $highestColumn = $worksheet->getHighestColumn();
@@ -660,7 +681,7 @@ class LeadController extends Controller
                         $records[] = $record;
                     }
                 }
-            } catch (\PhpOffice\PhpSpreadsheet\Exception $e) {
+            } catch (\Throwable $e) {
                 throw new \Exception('Failed to parse Excel file: ' . $e->getMessage());
             }
         }
