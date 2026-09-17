@@ -616,46 +616,60 @@ class LeadController extends Controller
                     throw new \RuntimeException('The uploaded file could not be read by the server.');
                 }
 
-                // Let PhpSpreadsheet identify the actual legacy/new Excel
-                // reader and avoid loading formatting, images, and other
-                // workbook metadata that is unnecessary for lead imports.
-                $reader = IOFactory::createReaderForFile($path);
-                $reader->setReadDataOnly(true);
-                $reader->setReadEmptyCells(false);
-                $spreadsheet = $reader->load($path);
-                $worksheet = $spreadsheet->getActiveSheet();
-
-                // Use data bounds instead of formatted bounds. A workbook can
-                // contain styling far beyond the actual table (sometimes all
-                // the way to XFD/1,048,576); iterating that area can exhaust
-                // PHP-FPM memory and surface in the browser as a network error.
-                $highestRow = $worksheet->getHighestDataRow();
-                $highestColumn = $worksheet->getHighestDataColumn();
-
-                if ($highestRow < 1) {
-                    throw new \Exception('Excel file is empty');
-                }
-
-                // Read only the actual data rectangle in one pass. This avoids
-                // creating millions of empty Cell objects for styled sheets.
-                $rows = $worksheet->rangeToArray(
-                    'A1:'.$highestColumn.$highestRow,
-                    null,
-                    true,
-                    false,
-                    false
-                );
-
+                // Normalize every Excel scalar to a string. Excel commonly
+                // stores phone numbers, IDs, and other cells as integers.
+                // Returning an integer from a string-typed closure causes an
+                // Excel-only TypeError during import.
                 $normalizeCell = function ($cellValue): string {
                     if ($cellValue instanceof \PhpOffice\PhpSpreadsheet\RichText\RichText) {
                         $cellValue = $cellValue->getPlainText();
                     }
 
-                    return $this->convertToUtf8($cellValue ?? '');
+                    if (is_array($cellValue) || is_object($cellValue)) {
+                        $cellValue = '';
+                    }
+
+                    return (string) $this->convertToUtf8($cellValue ?? '');
                 };
 
-                // Get headers (first row)
-                $headers = array_map($normalizeCell, $rows[0] ?? []);
+                // Find the first worksheet without loading all workbook data.
+                // Only one sheet is relevant for a lead import.
+                $probeReader = IOFactory::createReaderForFile($path);
+                $probeReader->setReadDataOnly(true);
+                $probeReader->setReadEmptyCells(false);
+                $probeReader->setIncludeCharts(false);
+                $sheetNames = $probeReader->listWorksheetNames($path);
+                $sheetName = $sheetNames[0] ?? null;
+                if (!$sheetName) {
+                    throw new \Exception('Excel file does not contain a worksheet');
+                }
+
+                // Load only the header row first. This avoids PhpSpreadsheet
+                // creating cells for the entire workbook before we know the
+                // table width.
+                $headerReader = IOFactory::createReaderForFile($path);
+                $headerReader->setReadDataOnly(true);
+                $headerReader->setReadEmptyCells(false);
+                $headerReader->setIncludeCharts(false);
+                $headerReader->setLoadSheetsOnly($sheetName);
+                $headerReader->setReadFilter(new class implements \PhpOffice\PhpSpreadsheet\Reader\IReadFilter {
+                    public function readCell(string $columnAddress, int $row, string $worksheetName = ''): bool
+                    {
+                        return $row === 1;
+                    }
+                });
+
+                $spreadsheet = $headerReader->load($path);
+                $worksheet = $spreadsheet->getActiveSheet();
+                $highestColumn = $worksheet->getHighestDataColumn();
+                $headerRows = $worksheet->rangeToArray(
+                    'A1:'.$highestColumn.'1',
+                    null,
+                    false,
+                    false,
+                    false
+                );
+                $headers = array_map($normalizeCell, $headerRows[0] ?? []);
 
                 // Remove empty trailing headers
                 while (!empty($headers) && empty(end($headers))) {
@@ -666,21 +680,75 @@ class LeadController extends Controller
                     throw new \Exception('No headers found in Excel file');
                 }
 
-                // Get records (starting from row 2), limited to the header width.
-                foreach (array_slice($rows, 1) as $row) {
-                    $record = array_map($normalizeCell, array_slice($row, 0, count($headers)));
+                unset($headerRows, $worksheet, $spreadsheet, $headerReader, $probeReader);
 
-                    while (count($record) < count($headers)) {
-                        $record[] = '';
+                // Read the body in bounded chunks. This supports both legacy
+                // XLS and modern XLSX while preventing large/styled workbooks
+                // from exhausting the PHP-FPM worker and becoming a browser
+                // "network error".
+                $chunkSize = 1000;
+                $startRow = 2;
+                $maxColumn = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex(count($headers));
+
+                while (true) {
+                    $endRow = $startRow + $chunkSize - 1;
+                    $reader = IOFactory::createReaderForFile($path);
+                    $reader->setReadDataOnly(true);
+                    $reader->setReadEmptyCells(false);
+                    $reader->setIncludeCharts(false);
+                    $reader->setLoadSheetsOnly($sheetName);
+                    $reader->setReadFilter(new class($startRow, $endRow, count($headers)) implements \PhpOffice\PhpSpreadsheet\Reader\IReadFilter {
+                        public function __construct(
+                            private int $startRow,
+                            private int $endRow,
+                            private int $maxColumn
+                        ) {}
+
+                        public function readCell(string $columnAddress, int $row, string $worksheetName = ''): bool
+                        {
+                            $column = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::columnIndexFromString($columnAddress);
+                            return $row >= $this->startRow
+                                && $row <= $this->endRow
+                                && $column <= $this->maxColumn;
+                        }
+                    });
+
+                    $spreadsheet = $reader->load($path);
+                    $worksheet = $spreadsheet->getActiveSheet();
+                    $highestDataRow = $worksheet->getHighestDataRow();
+
+                    if ($highestDataRow < $startRow) {
+                        unset($worksheet, $spreadsheet, $reader);
+                        break;
                     }
 
-                    // Only add if row has at least one non-empty value.
-                    if (array_filter($record, static fn ($value) => trim($value) !== '')) {
-                        $records[] = $record;
+                    foreach ($worksheet->rangeToArrayYieldRows(
+                        'A'.$startRow.':'.$maxColumn.$highestDataRow,
+                        null,
+                        false,
+                        false,
+                        false
+                    ) as $row) {
+                        $record = array_map($normalizeCell, array_slice($row, 0, count($headers)));
+
+                        while (count($record) < count($headers)) {
+                            $record[] = '';
+                        }
+
+                        if (array_filter($record, static fn ($value) => trim($value) !== '')) {
+                            $records[] = $record;
+                        }
                     }
+
+                    $loadedThrough = $highestDataRow;
+                    unset($worksheet, $spreadsheet, $reader);
+
+                    if ($loadedThrough < $endRow) {
+                        break;
+                    }
+
+                    $startRow = $endRow + 1;
                 }
-
-                unset($rows, $spreadsheet);
             } catch (\Throwable $e) {
                 throw new \Exception('Failed to parse Excel file: ' . $e->getMessage());
             }
