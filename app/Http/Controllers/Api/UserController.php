@@ -161,6 +161,15 @@ class UserController extends Controller
             'company_id' => 'nullable|exists:companies,id',
         ]);
 
+        // Keep the CRM super-admin login stable. Super-admin credentials are
+        // managed through the controlled server-side procedure, not the user
+        // management form, so an accidental UI update cannot replace them.
+        if ($user->isSuperAdmin() && (array_key_exists('email', $validated) || array_key_exists('password', $validated))) {
+            return response()->json([
+                'message' => 'Super-admin email and password cannot be changed from the CRM user management screen.',
+            ], 403);
+        }
+
         // Super admins can change roles to super_admin, others cannot
         if (isset($validated['role']) && $validated['role'] === 'super_admin' && !$currentUser->isSuperAdmin()) {
             abort(403, 'Only super admins can assign super admin role');

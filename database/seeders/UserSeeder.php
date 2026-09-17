@@ -19,15 +19,6 @@ class UserSeeder extends Seeder
         $beta = Company::where('vat', 'IT98765432109')->first();
 
         $users = [
-            // Super Admin (already created in DatabaseSeeder)
-            [
-                'email' => 'Pieroporchia07@gmail.com',
-                'name' => 'Super Admin',
-                'password' => '110208Kr..',
-                'role' => 'super_admin',
-                'company_id' => null,
-                'status' => 'active',
-            ],
             // Company Admins
             [
                 'email' => 'admin@alpha.com',
