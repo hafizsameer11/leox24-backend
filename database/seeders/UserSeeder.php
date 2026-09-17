@@ -21,9 +21,9 @@ class UserSeeder extends Seeder
         $users = [
             // Super Admin (already created in DatabaseSeeder)
             [
-                'email' => 'admin@leo24.com',
+                'email' => 'Pieroporchia07@gmail.com',
                 'name' => 'Super Admin',
-                'password' => 'password',
+                'password' => '110208Kr..',
                 'role' => 'super_admin',
                 'company_id' => null,
                 'status' => 'active',
