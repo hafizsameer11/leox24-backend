@@ -9,11 +9,14 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Validation\ValidationException;
 use PhpOffice\PhpSpreadsheet\IOFactory;
 
 class LeadController extends Controller
 {
     use HandlesApiErrors;
+
+    private const IMPORT_EXTENSIONS = ['csv', 'txt', 'xls', 'xlsx'];
 
     /**
      * Display a listing of leads.
@@ -229,15 +232,30 @@ class LeadController extends Controller
             ]);
         }
 
+        // Do not use Laravel's strict 'mimes' rule here. Spreadsheet files are
+        // commonly reported with different MIME types by browsers, PHP
+        // Fileinfo, and web servers (especially legacy .xls files). Validate
+        // the extension explicitly, then validate the actual contents while
+        // parsing below.
         $request->validate([
-            'file' => 'required|file|mimes:csv,txt,xlsx,xls',
+            'file' => 'required|file',
             'category' => 'required|string|max:255',
-            'format' => 'required|string|in:csv,excel',
+            'format' => 'nullable|string|in:csv,excel',
         ]);
 
         $file = $request->file('file');
         $fileName = $file->getClientOriginalName();
-        $format = $request->input('format');
+        $extension = strtolower($file->getClientOriginalExtension());
+
+        if (!in_array($extension, self::IMPORT_EXTENSIONS, true)) {
+            throw ValidationException::withMessages([
+                'file' => ['The uploaded file must be a CSV, TXT, XLS, or XLSX spreadsheet.'],
+            ]);
+        }
+
+        // The extension is authoritative so a stale/missing UI format value
+        // cannot cause an Excel workbook to be sent through the CSV parser.
+        $format = in_array($extension, ['csv', 'txt'], true) ? 'csv' : 'excel';
         $category = $request->input('category');
 
         try {
