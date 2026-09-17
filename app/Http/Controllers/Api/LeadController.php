@@ -280,6 +280,13 @@ class LeadController extends Controller
 
             ProcessLeadImport::dispatch($import->id)->onConnection('database');
 
+            Log::info('Lead import queued', [
+                'import_id' => $import->id,
+                'file_name' => $fileName,
+                'file_format' => $format,
+                'company_id' => $companyId,
+            ]);
+
             return response()->json([
                 'message' => 'Import queued',
                 'import_id' => $import->id,
@@ -349,6 +356,10 @@ class LeadController extends Controller
             'error_count' => 0,
             'error_message' => null,
         ]);
+        Log::info('Lead import processing started', [
+            'import_id' => $import->id,
+            'file_name' => $import->file_name,
+        ]);
 
         try {
             $absolutePath = Storage::path($import->stored_path);
@@ -417,6 +428,11 @@ class LeadController extends Controller
                 'processed_rows' => $processed,
                 'imported_count' => $imported,
                 'completed_at' => now(),
+            ]);
+            Log::info('Lead import completed', [
+                'import_id' => $import->id,
+                'processed_rows' => $processed,
+                'imported_count' => $imported,
             ]);
         } catch (\Throwable $e) {
             Lead::where('lead_import_id', $importId)->delete();
