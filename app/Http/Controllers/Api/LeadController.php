@@ -63,6 +63,7 @@ class LeadController extends Controller
             $query->where('category', $request->category);
         }
 
+        $this->applyLeadFieldFilters($query, $request);
         $this->applyImportFiltersFromRequest($query, $request);
 
         // Use explicit orderBy with index for better performance
@@ -105,12 +106,92 @@ class LeadController extends Controller
         $query->where(function ($q) use ($like) {
             $q->where('email', 'like', $like)
                 ->orWhere('phone', 'like', $like)
+                ->orWhere('mobile', 'like', $like)
                 ->orWhere('name', 'like', $like)
+                ->orWhere('age', 'like', $like)
+                ->orWhere('gender', 'like', $like)
+                ->orWhere('country', 'like', $like)
+                ->orWhere('intention', 'like', $like)
                 ->orWhere('file_name', 'like', $like)
                 ->orWhere(function ($q2) use ($like) {
                     $q2->whereNotNull('file_records')
                         ->where('file_records', 'like', $like);
                 });
+        });
+    }
+
+    /** Apply the explicit Leads-page filters while retaining legacy raw imports. */
+    private function applyLeadFieldFilters(Builder $query, Request $request): void
+    {
+        $filters = [
+            'age' => [
+                'column' => 'age',
+                'aliases' => ['Age', 'Eta', 'Età', 'EtÃ ', 'Anni'],
+            ],
+            'gender' => [
+                'column' => 'gender',
+                'aliases' => ['Gender', 'Sesso', 'Sex'],
+            ],
+            'country' => [
+                'column' => 'country',
+                'aliases' => ['Country', 'Paese', 'Nazione', 'Stato'],
+            ],
+            'intention' => [
+                'column' => 'intention',
+                'aliases' => ['Intention', 'Intent', 'Intenzione', 'Interesse', 'Interest', 'Lead Intention'],
+            ],
+        ];
+
+        foreach ($filters as $requestKey => $definition) {
+            $value = trim((string) $request->input($requestKey, ''));
+            if ($value === '') {
+                continue;
+            }
+
+            $this->applyLeadColumnOrRawFilter(
+                $query,
+                $definition['column'],
+                $value,
+                $definition['aliases']
+            );
+        }
+    }
+
+    /** Search a dedicated field first, then the original imported JSON fields. */
+    private function applyLeadColumnOrRawFilter(
+        Builder $query,
+        string $column,
+        string $value,
+        array $aliases
+    ): void {
+        $escaped = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], mb_strtolower($value));
+        $like = '%'.$escaped.'%';
+        $driver = $query->getModel()->getConnection()->getDriverName();
+
+        $query->where(function (Builder $filter) use ($column, $like, $aliases, $driver): void {
+            $filter->whereRaw('LOWER(CAST('.$column.' AS CHAR)) LIKE ?', [$like]);
+
+            $filter->orWhere(function (Builder $legacy) use ($like): void {
+                $legacy->whereNotNull('file_records')
+                    ->where('file_records', 'like', $like);
+            });
+
+            $filter->orWhere(function (Builder $raw) use ($like, $aliases, $driver): void {
+                $raw->whereNotNull('raw_attributes');
+                if ($driver === 'mysql') {
+                    $raw->where(function (Builder $aliasQuery) use ($like, $aliases): void {
+                        foreach ($aliases as $alias) {
+                            $path = '$."'.str_replace(['\\', '"'], ['\\\\', '\\"'], $alias).'"';
+                            $aliasQuery->orWhereRaw(
+                                'LOWER(JSON_UNQUOTE(JSON_EXTRACT(raw_attributes, ?))) LIKE ? COLLATE utf8mb4_unicode_ci',
+                                [$path, $like]
+                            );
+                        }
+                    });
+                } else {
+                    $raw->where('raw_attributes', 'like', $like);
+                }
+            });
         });
     }
 
@@ -395,6 +476,11 @@ class LeadController extends Controller
                         'name' => $mapped['name'],
                         'email' => $mapped['email'],
                         'phone' => $mapped['phone'],
+                        'mobile' => $mapped['mobile'],
+                        'age' => $mapped['age'],
+                        'gender' => $mapped['gender'],
+                        'country' => $mapped['country'],
+                        'intention' => $mapped['intention'],
                         'source' => 'import:'.$import->file_name,
                         'status' => 'cold',
                         'category' => $import->category,
@@ -506,7 +592,7 @@ class LeadController extends Controller
      *
      * @param  array<int, string>  $headers
      * @param  array<int, string>  $row
-     * @return array{name: string, email: ?string, phone: ?string, raw_attributes: array<string, string>}|null
+     * @return array{name: string, email: ?string, phone: ?string, mobile: ?string, age: ?string, gender: ?string, country: ?string, intention: ?string, raw_attributes: array<string, string>}|null
      */
     private function mapImportRowToLead(array $headers, array $row): ?array
     {
@@ -516,7 +602,13 @@ class LeadController extends Controller
             $cell = isset($row[$i]) ? $this->convertToUtf8((string) $row[$i]) : '';
             $cell = trim($cell);
             if ($label !== '' && $cell !== '') {
-                $raw[$label] = $cell;
+                $rawKey = $label;
+                $duplicate = 2;
+                while (array_key_exists($rawKey, $raw)) {
+                    $rawKey = $label.' ('.$duplicate.')';
+                    $duplicate++;
+                }
+                $raw[$rawKey] = $cell;
             }
         }
 
@@ -546,27 +638,78 @@ class LeadController extends Controller
         }
 
         $phone = null;
+        $mobile = null;
         foreach ($normPairs as $pair) {
             if ($pair['value'] === '') {
                 continue;
             }
-            if ($this->headerLooksLikePhone($pair['norm'])) {
+            if ($this->headerLooksLikeMobile($pair['norm'])) {
+                if ($mobile === null) {
+                    $mobile = $this->normalizePhone($pair['value']);
+                }
+                continue;
+            }
+            if ($this->headerLooksLikePhone($pair['norm']) && $phone === null) {
                 $phone = $this->normalizePhone($pair['value']);
-                break;
             }
         }
 
+        // If a file has two generic phone columns, preserve the second one as
+        // mobile rather than overwriting the primary phone value.
+        if ($phone !== null && $mobile === null) {
+            foreach ($normPairs as $pair) {
+                if ($pair['value'] === '' || ! $this->headerLooksLikePhone($pair['norm'])) {
+                    continue;
+                }
+                $candidate = $this->normalizePhone($pair['value']);
+                if ($candidate !== $phone) {
+                    $mobile = $candidate;
+                    break;
+                }
+            }
+        }
+
+        $age = $this->firstImportValue($normPairs, fn (string $norm): bool => $this->headerLooksLikeAge($norm));
+        if ($age !== null) {
+            $age = $this->normalizeAge($age);
+        }
+        if ($age === null) {
+            $dateOfBirth = $this->firstImportValue($normPairs, fn (string $norm): bool => $this->headerLooksLikeDateOfBirth($norm));
+            $age = $this->calculateAgeFromDateValue($dateOfBirth);
+        }
+
+        $gender = $this->firstImportValue($normPairs, fn (string $norm): bool => $this->headerLooksLikeGender($norm));
+        $country = $this->firstImportValue($normPairs, fn (string $norm): bool => $this->headerLooksLikeCountry($norm));
+        $intention = $this->firstImportValue($normPairs, fn (string $norm): bool => $this->headerLooksLikeIntention($norm));
+
         $name = $this->pickNameFromRow($normPairs);
         if ($name === '') {
-            $name = $email ?? $phone ?? reset($raw) ?: 'Unnamed lead';
+            $name = $email ?? $phone ?? $mobile ?? reset($raw) ?: 'Unnamed lead';
         }
 
         return [
             'name' => $name,
             'email' => $email,
             'phone' => $phone,
+            'mobile' => $mobile,
+            'age' => $age,
+            'gender' => $gender,
+            'country' => $country,
+            'intention' => $intention,
             'raw_attributes' => $raw,
         ];
+    }
+
+    /** @param array<int, array{norm: string, value: string, label: string}> $normPairs */
+    private function firstImportValue(array $normPairs, callable $matcher): ?string
+    {
+        foreach ($normPairs as $pair) {
+            if ($pair['value'] !== '' && $matcher($pair['norm'])) {
+                return $pair['value'];
+            }
+        }
+
+        return null;
     }
 
     private function normalizeHeaderToken(string $header): string
@@ -613,13 +756,116 @@ class LeadController extends Controller
 
     private function headerLooksLikePhone(string $norm): bool
     {
-        foreach (['telefono', 'telefonino', 'cellulare', 'mobile', 'phone', 'tel', 'fax', 'whatsapp'] as $token) {
+        if ($this->headerLooksLikeMobile($norm)) {
+            return false;
+        }
+
+        foreach (['telefono', 'telephone', 'phone', 'tel', 'landline', 'fisso', 'fax'] as $token) {
             if (str_contains($norm, $token)) {
                 return true;
             }
         }
 
         return false;
+    }
+
+    private function headerLooksLikeMobile(string $norm): bool
+    {
+        $compact = str_replace(' ', '', $norm);
+        foreach (['telefonino', 'cellulare', 'mobile', 'gsm', 'cell', 'whatsapp', 'phone2', 'secondphone', 'secondaryphone'] as $token) {
+            if (str_contains($compact, $token)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function headerLooksLikeAge(string $norm): bool
+    {
+        return in_array($norm, ['age', 'eta', 'anni'], true) || str_contains($norm, 'age');
+    }
+
+    private function headerLooksLikeDateOfBirth(string $norm): bool
+    {
+        return str_contains($norm, 'data nascita')
+            || str_contains($norm, 'date of birth')
+            || str_contains($norm, 'birth date')
+            || $norm === 'dob';
+    }
+
+    private function headerLooksLikeGender(string $norm): bool
+    {
+        return in_array($norm, ['gender', 'sesso', 'sex'], true);
+    }
+
+    private function headerLooksLikeCountry(string $norm): bool
+    {
+        return in_array($norm, ['country', 'paese', 'nazione', 'stato'], true)
+            || str_contains($norm, 'country');
+    }
+
+    private function headerLooksLikeIntention(string $norm): bool
+    {
+        return str_contains($norm, 'intention')
+            || str_contains($norm, 'intenzione')
+            || str_contains($norm, 'interesse')
+            || str_contains($norm, 'interest')
+            || $norm === 'intent'
+            || str_contains($norm, 'lead intent');
+    }
+
+    private function normalizeAge(string $value): ?string
+    {
+        if (preg_match('/\b(\d{1,3})\b/', $value, $matches) !== 1) {
+            return null;
+        }
+
+        $age = (int) $matches[1];
+        return $age >= 0 && $age <= 130 ? (string) $age : null;
+    }
+
+    private function calculateAgeFromDateValue(?string $value): ?string
+    {
+        if ($value === null || trim($value) === '') {
+            return null;
+        }
+
+        $raw = trim($value);
+        $birthDate = null;
+        if (is_numeric($raw) && (float) $raw > 1000) {
+            try {
+                $birthDate = \PhpOffice\PhpSpreadsheet\Shared\Date::excelToDateTimeObject((float) $raw);
+            } catch (\Throwable) {
+                $birthDate = null;
+            }
+        }
+
+        if (! $birthDate) {
+            foreach (['d/m/Y', 'd-m-Y', 'Y-m-d', 'Y/m/d', 'm/d/Y', 'd.m.Y'] as $format) {
+                $parsed = \DateTimeImmutable::createFromFormat('!'.$format, $raw);
+                if ($parsed !== false) {
+                    $birthDate = $parsed;
+                    break;
+                }
+            }
+        }
+
+        if (! $birthDate) {
+            try {
+                $birthDate = new \DateTimeImmutable($raw);
+            } catch (\Throwable) {
+                return null;
+            }
+        }
+
+        $today = new \DateTimeImmutable('today');
+        if ($birthDate > $today) {
+            return null;
+        }
+
+        $age = $birthDate->diff($today)->y;
+        return $age <= 130 ? (string) $age : null;
     }
 
     /**
@@ -688,7 +934,7 @@ class LeadController extends Controller
             if ($pair['value'] === '') {
                 continue;
             }
-            if ($this->headerLooksLikeEmail($pair['norm']) || $this->headerLooksLikePhone($pair['norm'])) {
+            if ($this->headerLooksLikeEmail($pair['norm']) || $this->headerLooksLikePhone($pair['norm']) || $this->headerLooksLikeMobile($pair['norm'])) {
                 continue;
             }
             if (str_contains($pair['norm'], 'name') || str_contains($pair['norm'], 'nome') || str_contains($pair['norm'], 'cognome')) {
@@ -1250,6 +1496,7 @@ class LeadController extends Controller
             $query->where('category', $request->category);
         }
 
+        $this->applyLeadFieldFilters($query, $request);
         $this->applyImportFiltersFromRequest($query, $request);
 
         // Get all leads (no pagination for export)
@@ -1257,7 +1504,7 @@ class LeadController extends Controller
 
         // Prepare CSV data
         $csvData = [];
-        $headers = ['ID', 'Name', 'Email', 'Phone', 'Source', 'Status', 'Category', 'File Name', 'Assigned To', 'Value', 'Created At'];
+        $headers = ['ID', 'Name', 'Email', 'Phone', 'Mobile', 'Age', 'Gender', 'Country', 'Intention', 'Source', 'Status', 'Category', 'File Name', 'Assigned To', 'Value', 'Created At'];
         $csvData[] = $headers;
 
         foreach ($leads as $lead) {
@@ -1266,6 +1513,11 @@ class LeadController extends Controller
                 $lead->name ?? '',
                 $lead->email ?? '',
                 $lead->phone ?? '',
+                $lead->mobile ?? '',
+                $lead->age ?? '',
+                $lead->gender ?? '',
+                $lead->country ?? '',
+                $lead->intention ?? '',
                 $lead->source ?? '',
                 $lead->status ?? '',
                 $lead->category ?? '',
