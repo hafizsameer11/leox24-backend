@@ -44,11 +44,50 @@ class CustomerController extends Controller
                     ->orWhere('customer_code', 'like', "%{$search}%")
                     ->orWhere('tax_code', 'like', "%{$search}%")
                     ->orWhere('vat', 'like', "%{$search}%")
-                    ->orWhere('city', 'like', "%{$search}%");
+                    ->orWhere('city', 'like', "%{$search}%")
+                    ->orWhere('gender', 'like', "%{$search}%")
+                    ->orWhere('country', 'like', "%{$search}%");
             });
         }
 
+        $this->applyCustomerFilters($query, $request);
+
         return response()->json($query->latest()->paginate($request->integer('per_page', 15)));
+    }
+
+    /** Apply the Customers-page filters against the real customer columns. */
+    private function applyCustomerFilters($query, Request $request): void
+    {
+        if ($request->filled('age')) {
+            $ageInput = trim((string) $request->input('age'));
+
+            if (preg_match('/^\d{1,3}$/', $ageInput) !== 1 || (int) $ageInput > 130) {
+                $query->whereRaw('1 = 0');
+            } else {
+                $age = (int) $ageInput;
+                $today = now();
+                $latestBirthDate = $today->copy()->subYears($age)->toDateString();
+                $earliestBirthDate = $today->copy()->subYears($age + 1)->toDateString();
+
+                // A customer has the requested age when their birthday has
+                // occurred this year and they are not yet the next age.
+                $query->whereNotNull('date_of_birth')
+                    ->whereDate('date_of_birth', '<=', $latestBirthDate)
+                    ->whereDate('date_of_birth', '>', $earliestBirthDate);
+            }
+        }
+
+        foreach (['gender', 'country'] as $field) {
+            $value = trim((string) $request->input($field, ''));
+            if ($value === '') {
+                continue;
+            }
+
+            $query->whereRaw(
+                'LOWER('.$field.') LIKE ?',
+                ['%'.mb_strtolower($value).'%']
+            );
+        }
     }
 
     public function store(Request $request)
