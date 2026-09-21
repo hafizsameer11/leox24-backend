@@ -69,11 +69,11 @@ class CustomerController extends Controller
                 $latestBirthDate = $today->copy()->subYears($age)->toDateString();
                 $earliestBirthDate = $today->copy()->subYears($age + 1)->toDateString();
 
-                // A customer has the requested age when their birthday has
-                // occurred this year and they are not yet the next age.
-                $query->whereNotNull('date_of_birth')
-                    ->whereDate('date_of_birth', '<=', $latestBirthDate)
-                    ->whereDate('date_of_birth', '>', $earliestBirthDate);
+                // The Customers page keeps its original age filter. New records
+                // use a birth-date range, while older records have one date; the
+                // range check supports both without adding new filter controls.
+                $query->whereRaw('COALESCE(date_of_birth_to, date_of_birth) > ?', [$earliestBirthDate])
+                    ->whereRaw('COALESCE(date_of_birth_from, date_of_birth) <= ?', [$latestBirthDate]);
             }
         }
 
@@ -99,11 +99,14 @@ class CustomerController extends Controller
             : $user->company_id;
 
         $this->ensureCategoryAccess($validated['category_id'] ?? null, $companyId);
+        // Customer codes are system-owned. Ignore any client-supplied value.
+        unset($validated['customer_code']);
         $validated['created_by'] = $user->id;
         $validated['date_added'] = $validated['date_added'] ?? now()->toDateString();
         $customer = $this->deduplicationService->findOrCreateCustomer($validated, $companyId);
+        $wasCreated = $customer->wasRecentlyCreated;
 
-        if ($customer->wasRecentlyCreated) {
+        if ($wasCreated) {
             $this->activityLogService->logCreated($customer);
         }
 
@@ -237,7 +240,6 @@ class CustomerController extends Controller
                 ? ['required', 'string', 'max:80', Rule::unique('customers', 'phone')]
                 : ['sometimes', 'string', 'max:80', Rule::unique('customers', 'phone')->ignore($ignoreId)],
             'vat' => ['nullable', 'string', 'max:120', Rule::unique('customers', 'vat')->ignore($ignoreId)],
-            'customer_code' => ['nullable', 'string', 'max:80', Rule::unique('customers', 'customer_code')->ignore($ignoreId)],
             'category_id' => 'nullable|integer|exists:categories,id',
             'title' => 'nullable|string|max:30',
             'first_name' => 'nullable|string|max:120',
@@ -250,8 +252,10 @@ class CustomerController extends Controller
             'zip_code' => 'nullable|string|max:30',
             'state_province' => 'nullable|string|max:120',
             'country' => 'nullable|string|max:100',
-            'date_of_birth' => 'nullable|date',
+            'date_of_birth_from' => 'nullable|date',
+            'date_of_birth_to' => 'nullable|date|after_or_equal:date_of_birth_from',
             'place_of_birth' => 'nullable|string|max:160',
+            'city_of_birth' => 'nullable|string|max:120',
             'branch' => 'nullable|string|max:120',
             'date_added' => 'nullable|date',
             'tax_code' => 'nullable|string|max:120',

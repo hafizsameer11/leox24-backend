@@ -22,6 +22,18 @@ class Customer extends Model
                 $query->where('company_id', $user->company_id);
             }
         });
+
+        static::created(function (Customer $customer) {
+            if ($customer->customer_code) {
+                return;
+            }
+
+            // The immutable database ID makes each automatically generated
+            // customer code unique without a race-prone "next number" query.
+            $customer->forceFill([
+                'customer_code' => 'CUS-'.str_pad((string) $customer->getKey(), 6, '0', STR_PAD_LEFT),
+            ])->saveQuietly();
+        });
     }
 
     protected $fillable = [
@@ -38,10 +50,11 @@ class Customer extends Model
         'title',
         'second_last_name',
         'customer_group',
-        'customer_code',
         'gender',
-        'date_of_birth',
+        'date_of_birth_from',
+        'date_of_birth_to',
         'place_of_birth',
+        'city_of_birth',
         'branch',
         'date_added',
         'city',
@@ -83,6 +96,8 @@ class Customer extends Model
     {
         return [
             'date_of_birth' => 'date',
+            'date_of_birth_from' => 'date',
+            'date_of_birth_to' => 'date',
             'date_added' => 'date',
             'privacy_date' => 'date',
             'privacy_consent_processing' => 'boolean',
