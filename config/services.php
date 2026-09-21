@@ -48,6 +48,7 @@ return [
         'whatsapp_number' => env('TWILIO_WHATSAPP_NUMBER'),
         'webhook_secret' => env('TWILIO_WEBHOOK_SECRET'),
         'webhook_url' => env('TWILIO_WEBHOOK_URL'), // Public URL for webhooks (use ngrok for local dev)
+        'sms_status_callback_url' => env('TWILIO_SMS_STATUS_CALLBACK_URL'),
         'agent_phone_number' => env('TWILIO_AGENT_PHONE_NUMBER'), // Agent's phone number (who will answer the call)
     ],
 

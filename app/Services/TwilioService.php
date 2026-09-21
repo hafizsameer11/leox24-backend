@@ -12,13 +12,14 @@ class TwilioService
     private ?Client $client;
     private string $phoneNumber;
     private string $whatsAppNumber;
+    private ?string $verifiedSmsSender = null;
 
     public function __construct()
     {
         $accountSid = config('services.twilio.account_sid');
         $authToken = config('services.twilio.auth_token');
-        $this->phoneNumber = config('services.twilio.phone_number', '');
-        $this->whatsAppNumber = config('services.twilio.whatsapp_number', $this->phoneNumber);
+        $this->phoneNumber = (string) config('services.twilio.phone_number', '');
+        $this->whatsAppNumber = (string) config('services.twilio.whatsapp_number', $this->phoneNumber);
 
         if (empty($accountSid) || empty($authToken)) {
             Log::warning('Twilio credentials not configured');
@@ -221,20 +222,29 @@ class TwilioService
     public function sendSMS(string $to, string $message, ?array $mediaUrls = null): array
     {
         if (!$this->client) {
-            throw new \RuntimeException('Twilio is not configured.');
+            throw new \RuntimeException('Twilio is not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_PHONE_NUMBER.');
         }
 
-        // Normalize phone number to E.164 format
-        $to = preg_replace('/[^0-9+]/', '', $to);
-        if (!str_starts_with($to, '+')) {
-            $to = '+' . $to;
-        }
+        $to = $this->normalizeE164PhoneNumber($to, 'Recipient phone number');
+        $from = $this->verifiedSmsSender();
+        $statusCallbackUrl = $this->smsStatusCallbackUrl();
 
         try {
             $params = [
-                'from' => $this->phoneNumber,
+                'from' => $from,
                 'body' => $message,
             ];
+
+            if ($statusCallbackUrl) {
+                $params['statusCallback'] = $statusCallbackUrl;
+            }
+
+            Log::info('Submitting SMS to Twilio', [
+                'to' => $this->maskPhoneNumber($to),
+                'from' => $this->maskPhoneNumber($from),
+                'message_length' => mb_strlen($message),
+                'delivery_tracking' => (bool) $statusCallbackUrl,
+            ]);
 
             // Add media URLs if provided (for MMS)
             if (!empty($mediaUrls) && is_array($mediaUrls)) {
@@ -292,19 +302,134 @@ class TwilioService
             }
 
             $msg = $this->client->messages->create($to, $params);
+            $status = strtolower((string) $msg->status);
+            $acceptedStatuses = ['accepted', 'queued', 'scheduled', 'sending', 'sent'];
+
+            if (!$msg->sid || !in_array($status, $acceptedStatuses, true)) {
+                Log::error('Twilio did not accept SMS for delivery', [
+                    'sid' => $msg->sid,
+                    'status' => $status ?: 'unknown',
+                    'to' => $this->maskPhoneNumber($to),
+                    'from' => $this->maskPhoneNumber($from),
+                    'error_code' => $msg->errorCode,
+                    'error_message' => $msg->errorMessage,
+                ]);
+
+                throw new \RuntimeException(
+                    'Twilio did not accept this SMS for delivery'.($msg->errorCode ? " (code {$msg->errorCode})" : '').'.'
+                );
+            }
+
+            Log::info('Twilio accepted SMS for delivery', [
+                'sid' => $msg->sid,
+                'status' => $status,
+                'to' => $this->maskPhoneNumber($to),
+                'from' => $this->maskPhoneNumber($from),
+                'delivery_tracking' => (bool) $statusCallbackUrl,
+            ]);
 
             return [
                 'success' => true,
                 'sid' => $msg->sid,
-                'status' => $msg->status,
+                'status' => $status,
+                'delivery_tracking' => (bool) $statusCallbackUrl,
             ];
         } catch (TwilioException $e) {
             Log::error('Twilio SMS failed', [
-                'to' => $to,
+                'to' => $this->maskPhoneNumber($to),
+                'from' => $this->maskPhoneNumber($from),
+                'code' => $e->getCode(),
                 'error' => $e->getMessage(),
             ]);
-            throw new \RuntimeException('Failed to send SMS: ' . $e->getMessage());
+            throw new \RuntimeException('Twilio rejected the SMS request (code '.$e->getCode().'): '.$e->getMessage());
         }
+    }
+
+    /** Validate E.164 rather than silently guessing a country code. */
+    private function normalizeE164PhoneNumber(string $phoneNumber, string $fieldName): string
+    {
+        $normalized = trim($phoneNumber);
+        $normalized = preg_replace('/[\s().-]/', '', $normalized) ?? '';
+
+        if (str_starts_with($normalized, '00')) {
+            $normalized = '+'.substr($normalized, 2);
+        }
+
+        if (preg_match('/^\+[1-9]\d{7,14}$/', $normalized) !== 1) {
+            throw new \InvalidArgumentException($fieldName.' must be in international E.164 format, for example +393331234567.');
+        }
+
+        return $normalized;
+    }
+
+    /** Confirm the configured sender belongs to this account and can send SMS. */
+    private function verifiedSmsSender(): string
+    {
+        if ($this->verifiedSmsSender) {
+            return $this->verifiedSmsSender;
+        }
+
+        $from = $this->normalizeE164PhoneNumber($this->phoneNumber, 'TWILIO_PHONE_NUMBER');
+
+        try {
+            $phoneNumbers = $this->client->incomingPhoneNumbers->read(['phoneNumber' => $from], 1);
+            if (empty($phoneNumbers)) {
+                throw new \RuntimeException('TWILIO_PHONE_NUMBER is not an active phone number in this Twilio account.');
+            }
+
+            $phoneNumber = $phoneNumbers[0];
+            $capabilities = $phoneNumber->capabilities;
+            if (!($capabilities->sms ?? false)) {
+                throw new \RuntimeException('TWILIO_PHONE_NUMBER is active but is not SMS-capable. Use an SMS-capable Twilio number.');
+            }
+
+            $this->verifiedSmsSender = $from;
+            Log::info('Verified Twilio SMS sender', [
+                'from' => $this->maskPhoneNumber($from),
+                'status' => $phoneNumber->status,
+                'sms_capable' => true,
+            ]);
+
+            return $this->verifiedSmsSender;
+        } catch (TwilioException $e) {
+            Log::error('Unable to verify Twilio SMS sender', [
+                'from' => $this->maskPhoneNumber($from),
+                'code' => $e->getCode(),
+                'error' => $e->getMessage(),
+            ]);
+
+            throw new \RuntimeException('Twilio could not verify TWILIO_PHONE_NUMBER (code '.$e->getCode().'): '.$e->getMessage());
+        }
+    }
+
+    /** Configure delivery callbacks only when a public, valid callback URL exists. */
+    private function smsStatusCallbackUrl(): ?string
+    {
+        $callbackUrl = trim((string) config('services.twilio.sms_status_callback_url', ''));
+        if ($callbackUrl === '') {
+            $baseUrl = trim((string) (config('services.twilio.webhook_url') ?: config('app.url', '')));
+            if ($baseUrl !== '') {
+                $callbackUrl = rtrim($baseUrl, '/').'/api/sms/twilio/status';
+            }
+        }
+
+        if ($callbackUrl === '' || !filter_var($callbackUrl, FILTER_VALIDATE_URL)
+            || str_contains($callbackUrl, 'localhost') || str_contains($callbackUrl, '127.0.0.1')) {
+            Log::warning('Twilio SMS delivery callback is unavailable; accepted messages will not receive asynchronous delivery logs', [
+                'callback_configured' => $callbackUrl !== '',
+            ]);
+            return null;
+        }
+
+        return $callbackUrl;
+    }
+
+    private function maskPhoneNumber(string $phoneNumber): string
+    {
+        $digits = preg_replace('/\D/', '', $phoneNumber) ?: '';
+        return strlen($digits) > 4
+            ? '+'.substr($digits, 0, 2).'••••'.substr($digits, -2)
+            : '••••';
     }
 
     /**
