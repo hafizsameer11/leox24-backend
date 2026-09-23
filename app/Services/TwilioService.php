@@ -580,6 +580,61 @@ class TwilioService
         }
     }
 
+    /**
+     * Read Twilio's current status for a WhatsApp message after submission.
+     * Submission/queueing is not delivery, so callers must use this before
+     * reporting a message as delivered.
+     */
+    public function getWhatsAppMessageStatus(string $messageSid): array
+    {
+        if (! $this->client) {
+            throw new \RuntimeException('Twilio is not configured. Set TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN.');
+        }
+
+        if (preg_match('/^SM[a-f0-9]{32}$/i', $messageSid) !== 1) {
+            throw new \InvalidArgumentException('The WhatsApp Message SID is invalid.');
+        }
+
+        try {
+            $message = $this->client->messages($messageSid)->fetch();
+            $status = strtolower((string) $message->status);
+            $from = (string) $message->from;
+            $to = (string) $message->to;
+
+            if (! str_starts_with(strtolower($from), 'whatsapp:') || ! str_starts_with(strtolower($to), 'whatsapp:')) {
+                throw new \InvalidArgumentException('This Message SID does not belong to a WhatsApp message.');
+            }
+
+            Log::info('Retrieved Twilio WhatsApp delivery status', [
+                'sid' => $message->sid,
+                'status' => $status ?: 'unknown',
+                'to' => $this->maskPhoneNumber($to),
+                'from' => $this->maskPhoneNumber($from),
+                'error_code' => $message->errorCode,
+                'error_message' => $message->errorMessage,
+            ]);
+
+            return [
+                'sid' => $message->sid,
+                'status' => $status ?: 'unknown',
+                'error_code' => $message->errorCode,
+                'error_message' => $message->errorMessage,
+                'to' => $this->maskPhoneNumber($to),
+                'from' => $this->maskPhoneNumber($from),
+                'is_delivered' => $status === 'delivered',
+                'is_terminal' => in_array($status, ['delivered', 'failed', 'undelivered'], true),
+            ];
+        } catch (TwilioException $e) {
+            Log::error('Unable to retrieve Twilio WhatsApp message status', [
+                'sid' => $messageSid,
+                'code' => $e->getCode(),
+                'error' => $e->getMessage(),
+            ]);
+
+            throw new \RuntimeException('Twilio could not retrieve this WhatsApp message (code '.$e->getCode().'): '.$e->getMessage());
+        }
+    }
+
     /** WhatsApp uses the same E.164 number format as SMS, with Twilio's channel prefix. */
     private function normalizeWhatsAppAddress(string $address, string $fieldName): string
     {

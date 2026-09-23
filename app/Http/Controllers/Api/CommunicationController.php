@@ -95,6 +95,33 @@ class CommunicationController extends Controller
         return response()->noContent();
     }
 
+    /** Return Twilio's current delivery status for a WhatsApp message. */
+    public function messageStatus(Request $request, string $messageSid)
+    {
+        $user = $request->user();
+
+        if (! $user->isSuperAdmin()) {
+            return response()->json(['message' => 'Only super administrators can view WhatsApp delivery status'], 403);
+        }
+
+        try {
+            return response()->json(
+                $this->twilioService->getWhatsAppMessageStatus($messageSid)
+            );
+        } catch (\Throwable $e) {
+            Log::error('WhatsApp delivery status lookup failed', [
+                'user_id' => $user->id,
+                'message_sid' => $messageSid,
+                'exception' => $e::class,
+                'error' => $e->getMessage(),
+            ]);
+
+            return response()->json([
+                'message' => $e->getMessage(),
+            ], $e instanceof \InvalidArgumentException ? 422 : 502);
+        }
+    }
+
     private function hasValidTwilioSignature(Request $request): bool
     {
         $authToken = (string) config('services.twilio.auth_token', '');

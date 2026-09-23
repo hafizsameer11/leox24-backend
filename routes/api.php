@@ -211,4 +211,7 @@ Route::post('/sms/twilio/status', [\App\Http\Controllers\Api\SmsController::clas
 Route::post('/communications/whatsapp/status', [\App\Http\Controllers\Api\CommunicationController::class, 'statusCallback']);
 
 // Communications
-Route::middleware('auth:sanctum')->post('/communications/whatsapp/send', [\App\Http\Controllers\Api\CommunicationController::class, 'sendWhatsApp']);
+Route::middleware('auth:sanctum')->group(function () {
+    Route::post('/communications/whatsapp/send', [\App\Http\Controllers\Api\CommunicationController::class, 'sendWhatsApp']);
+    Route::get('/communications/whatsapp/{messageSid}/status', [\App\Http\Controllers\Api\CommunicationController::class, 'messageStatus']);
+});
