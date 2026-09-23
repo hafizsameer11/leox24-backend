@@ -19,7 +19,10 @@ class TwilioService
         $accountSid = config('services.twilio.account_sid');
         $authToken = config('services.twilio.auth_token');
         $this->phoneNumber = (string) config('services.twilio.phone_number', '');
-        $this->whatsAppNumber = (string) config('services.twilio.whatsapp_number', $this->phoneNumber);
+        // A normal SMS sender is not automatically a WhatsApp sender. Keep this
+        // separate so a missing WhatsApp configuration fails clearly instead of
+        // submitting an invalid "whatsapp:" sender to Twilio.
+        $this->whatsAppNumber = trim((string) config('services.twilio.whatsapp_number', ''));
 
         if (empty($accountSid) || empty($authToken)) {
             Log::warning('Twilio credentials not configured');
@@ -444,24 +447,21 @@ class TwilioService
     ): array
     {
         if (!$this->client) {
-            throw new \RuntimeException('Twilio is not configured.');
+            throw new \RuntimeException('Twilio is not configured. Set TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN.');
         }
 
-        // Ensure numbers are in E.164 format and prefixed with "whatsapp:"
-        $to = str_starts_with($to, 'whatsapp:') ? $to : 'whatsapp:' . $to;
-        $from = str_starts_with($this->whatsAppNumber, 'whatsapp:') ? $this->whatsAppNumber : 'whatsapp:' . $this->whatsAppNumber;
-        Log::info('WHATSAPP FROM NUMBER USED', [
-            'raw_whatsapp_number' => $this->whatsAppNumber,
-            'final_from' => $from
-        ]);
-        Log::info('TWILIO SID USED', [
-            'sid' => config('services.twilio.account_sid')
-        ]);
+        $to = $this->normalizeWhatsAppAddress($to, 'Recipient WhatsApp number');
+        $from = $this->normalizeWhatsAppAddress($this->whatsAppNumber, 'TWILIO_WHATSAPP_NUMBER');
+        $statusCallbackUrl = $this->whatsAppStatusCallbackUrl();
 
         try {
             $params = [
                 'from' => $from,
             ];
+
+            if ($statusCallbackUrl) {
+                $params['statusCallback'] = $statusCallbackUrl;
+            }
 
             if (!empty($templateSid)) {
                 $params['contentSid'] = $templateSid;
@@ -528,19 +528,90 @@ class TwilioService
                 }
             }
 
+            Log::info('Submitting WhatsApp message to Twilio', [
+                'to' => $this->maskPhoneNumber($to),
+                'from' => $this->maskPhoneNumber($from),
+                'message_length' => mb_strlen($message),
+                'using_template' => ! empty($templateSid),
+                'delivery_tracking' => (bool) $statusCallbackUrl,
+            ]);
+
             $msg = $this->client->messages->create($to, $params);
+            $status = strtolower((string) $msg->status);
+            $acceptedStatuses = ['accepted', 'queued', 'scheduled', 'sending', 'sent'];
+
+            if (! $msg->sid || ! in_array($status, $acceptedStatuses, true)) {
+                Log::error('Twilio did not accept WhatsApp for delivery', [
+                    'sid' => $msg->sid,
+                    'status' => $status ?: 'unknown',
+                    'to' => $this->maskPhoneNumber($to),
+                    'from' => $this->maskPhoneNumber($from),
+                    'error_code' => $msg->errorCode,
+                    'error_message' => $msg->errorMessage,
+                ]);
+
+                throw new \RuntimeException(
+                    'Twilio did not accept this WhatsApp message for delivery'.($msg->errorCode ? " (code {$msg->errorCode})" : '').'.'
+                );
+            }
+
+            Log::info('Twilio accepted WhatsApp for delivery', [
+                'sid' => $msg->sid,
+                'status' => $status,
+                'to' => $this->maskPhoneNumber($to),
+                'from' => $this->maskPhoneNumber($from),
+                'delivery_tracking' => (bool) $statusCallbackUrl,
+            ]);
 
             return [
                 'success' => true,
                 'sid' => $msg->sid,
-                'status' => $msg->status,
+                'status' => $status,
+                'delivery_tracking' => (bool) $statusCallbackUrl,
             ];
         } catch (TwilioException $e) {
             Log::error('Twilio WhatsApp message failed', [
-                'to' => $to,
+                'to' => $this->maskPhoneNumber($to),
+                'from' => $this->maskPhoneNumber($from),
+                'code' => $e->getCode(),
                 'error' => $e->getMessage(),
             ]);
-            throw new \RuntimeException('Failed to send WhatsApp message: ' . $e->getMessage());
+            throw new \RuntimeException('Twilio rejected the WhatsApp request (code '.$e->getCode().'): '.$e->getMessage());
         }
+    }
+
+    /** WhatsApp uses the same E.164 number format as SMS, with Twilio's channel prefix. */
+    private function normalizeWhatsAppAddress(string $address, string $fieldName): string
+    {
+        $number = trim($address);
+        if (str_starts_with(strtolower($number), 'whatsapp:')) {
+            $number = substr($number, strlen('whatsapp:'));
+        }
+
+        return 'whatsapp:'.$this->normalizeE164PhoneNumber($number, $fieldName);
+    }
+
+    /** Configure WhatsApp delivery callbacks only for a public HTTPS endpoint. */
+    private function whatsAppStatusCallbackUrl(): ?string
+    {
+        $callbackUrl = trim((string) config('services.twilio.whatsapp_status_callback_url', ''));
+        if ($callbackUrl === '') {
+            $appUrl = trim((string) config('app.url', ''));
+            if ($appUrl !== '') {
+                $callbackUrl = rtrim($appUrl, '/').'/api/communications/whatsapp/status';
+            }
+        }
+
+        if ($callbackUrl === '' || ! filter_var($callbackUrl, FILTER_VALIDATE_URL)
+            || str_contains($callbackUrl, 'localhost') || str_contains($callbackUrl, '127.0.0.1')
+            || ! str_starts_with(strtolower($callbackUrl), 'https://')) {
+            Log::warning('Twilio WhatsApp delivery callback is unavailable; accepted messages will not receive asynchronous delivery logs', [
+                'callback_configured' => $callbackUrl !== '',
+            ]);
+
+            return null;
+        }
+
+        return $callbackUrl;
     }
 }

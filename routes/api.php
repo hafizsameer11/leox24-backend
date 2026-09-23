@@ -208,6 +208,7 @@ Route::post('/subscription/webhook', [SubscriptionController::class, 'webhook'])
 Route::post('/calls/twilio/status', [CallController::class, 'twilioStatusWebhook']);
 Route::get('/calls/twilio/twiml', [CallController::class, 'twilioTwiML']);
 Route::post('/sms/twilio/status', [\App\Http\Controllers\Api\SmsController::class, 'statusCallback']);
+Route::post('/communications/whatsapp/status', [\App\Http\Controllers\Api\CommunicationController::class, 'statusCallback']);
 
 // Communications
 Route::middleware('auth:sanctum')->post('/communications/whatsapp/send', [\App\Http\Controllers\Api\CommunicationController::class, 'sendWhatsApp']);

@@ -37,6 +37,8 @@ class Lead extends Model
         'age',
         'gender',
         'country',
+        'city',
+        'date_of_birth',
         'intention',
         'source',
         'status',
@@ -54,6 +56,7 @@ class Lead extends Model
         'file_headers' => 'array',
         'file_records' => 'array',
         'raw_attributes' => 'array',
+        'date_of_birth' => 'date:Y-m-d',
         'value' => 'decimal:2',
     ];
 

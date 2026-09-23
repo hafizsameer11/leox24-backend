@@ -27,6 +27,9 @@ class LeadController extends Controller
     public function index(Request $request)
     {
         $user = $request->user();
+        if ($user->isSuperAdmin() && $request->filled('company_id')) {
+            $request->validate(['company_id' => 'integer|exists:companies,id']);
+        }
         $companyId = $user->isSuperAdmin() && $request->has('company_id')
             ? $request->company_id
             : ($user->company_id ?? null);
@@ -111,6 +114,8 @@ class LeadController extends Controller
                 ->orWhere('age', 'like', $like)
                 ->orWhere('gender', 'like', $like)
                 ->orWhere('country', 'like', $like)
+                ->orWhere('city', 'like', $like)
+                ->orWhere('date_of_birth', 'like', $like)
                 ->orWhere('intention', 'like', $like)
                 ->orWhere('file_name', 'like', $like)
                 ->orWhere(function ($q2) use ($like) {
@@ -136,6 +141,10 @@ class LeadController extends Controller
                 'column' => 'country',
                 'aliases' => ['Country', 'Paese', 'Nazione', 'Stato'],
             ],
+            'city' => [
+                'column' => 'city',
+                'aliases' => ['City', 'Città', 'Citta', 'Comune', 'Località', 'Localita', 'Municipality'],
+            ],
             'intention' => [
                 'column' => 'intention',
                 'aliases' => ['Intention', 'Intent', 'Intenzione', 'Interesse', 'Interest', 'Lead Intention'],
@@ -154,6 +163,29 @@ class LeadController extends Controller
                 $value,
                 $definition['aliases']
             );
+        }
+
+        foreach (['date_of_birth_from', 'date_of_birth_to'] as $field) {
+            $value = trim((string) $request->input($field, ''));
+            if ($value !== '') {
+                $request->validate([$field => 'date_format:Y-m-d']);
+            }
+        }
+
+        if ($request->filled('date_of_birth_from')) {
+            $query->where(function (Builder $dateFilter) use ($request): void {
+                $dateFilter->whereDate('date_of_birth', '>=', (string) $request->input('date_of_birth_from'))
+                    // Legacy file-batch leads contain several contacts in JSON.
+                    // They are retained here and filtered per-contact in the SPA.
+                    ->orWhereNotNull('file_records');
+            });
+        }
+
+        if ($request->filled('date_of_birth_to')) {
+            $query->where(function (Builder $dateFilter) use ($request): void {
+                $dateFilter->whereDate('date_of_birth', '<=', (string) $request->input('date_of_birth_to'))
+                    ->orWhereNotNull('file_records');
+            });
         }
     }
 
@@ -480,6 +512,8 @@ class LeadController extends Controller
                         'age' => $mapped['age'],
                         'gender' => $mapped['gender'],
                         'country' => $mapped['country'],
+                        'city' => $mapped['city'],
+                        'date_of_birth' => $mapped['date_of_birth'],
                         'intention' => $mapped['intention'],
                         'source' => 'import:'.$import->file_name,
                         'status' => 'cold',
@@ -669,17 +703,19 @@ class LeadController extends Controller
             }
         }
 
+        $dateOfBirth = $this->firstImportValue($normPairs, fn (string $norm): bool => $this->headerLooksLikeDateOfBirth($norm));
+        $normalizedDateOfBirth = $this->normalizeDateOfBirth($dateOfBirth);
         $age = $this->firstImportValue($normPairs, fn (string $norm): bool => $this->headerLooksLikeAge($norm));
         if ($age !== null) {
             $age = $this->normalizeAge($age);
         }
         if ($age === null) {
-            $dateOfBirth = $this->firstImportValue($normPairs, fn (string $norm): bool => $this->headerLooksLikeDateOfBirth($norm));
             $age = $this->calculateAgeFromDateValue($dateOfBirth);
         }
 
         $gender = $this->firstImportValue($normPairs, fn (string $norm): bool => $this->headerLooksLikeGender($norm));
         $country = $this->firstImportValue($normPairs, fn (string $norm): bool => $this->headerLooksLikeCountry($norm));
+        $city = $this->firstImportValue($normPairs, fn (string $norm): bool => $this->headerLooksLikeCity($norm));
         $intention = $this->firstImportValue($normPairs, fn (string $norm): bool => $this->headerLooksLikeIntention($norm));
 
         $name = $this->pickNameFromRow($normPairs);
@@ -695,6 +731,8 @@ class LeadController extends Controller
             'age' => $age,
             'gender' => $gender,
             'country' => $country,
+            'city' => $city,
+            'date_of_birth' => $normalizedDateOfBirth,
             'intention' => $intention,
             'raw_attributes' => $raw,
         ];
@@ -805,6 +843,13 @@ class LeadController extends Controller
             || str_contains($norm, 'country');
     }
 
+    private function headerLooksLikeCity(string $norm): bool
+    {
+        return in_array($norm, ['city', 'citta', 'comune', 'localita', 'municipality'], true)
+            || str_contains($norm, 'city')
+            || str_contains($norm, 'citta');
+    }
+
     private function headerLooksLikeIntention(string $norm): bool
     {
         return str_contains($norm, 'intention')
@@ -866,6 +911,49 @@ class LeadController extends Controller
 
         $age = $birthDate->diff($today)->y;
         return $age <= 130 ? (string) $age : null;
+    }
+
+    /** Convert supported spreadsheet birth-date values to a database-safe ISO date. */
+    private function normalizeDateOfBirth(?string $value): ?string
+    {
+        if ($value === null || trim($value) === '') {
+            return null;
+        }
+
+        $raw = trim($value);
+        $birthDate = null;
+        if (is_numeric($raw) && (float) $raw > 1000) {
+            try {
+                $birthDate = \PhpOffice\PhpSpreadsheet\Shared\Date::excelToDateTimeObject((float) $raw);
+            } catch (\Throwable) {
+                $birthDate = null;
+            }
+        }
+
+        if (! $birthDate) {
+            foreach (['d/m/Y', 'd-m-Y', 'Y-m-d', 'Y/m/d', 'm/d/Y', 'd.m.Y'] as $format) {
+                $parsed = \DateTimeImmutable::createFromFormat('!'.$format, $raw);
+                if ($parsed !== false) {
+                    $birthDate = $parsed;
+                    break;
+                }
+            }
+        }
+
+        if (! $birthDate) {
+            try {
+                $birthDate = new \DateTimeImmutable($raw);
+            } catch (\Throwable) {
+                return null;
+            }
+        }
+
+        $today = new \DateTimeImmutable('today');
+        if ($birthDate > $today || $birthDate->diff($today)->y > 130) {
+            return null;
+        }
+
+        return $birthDate->format('Y-m-d');
     }
 
     /**
@@ -1466,6 +1554,9 @@ class LeadController extends Controller
     public function export(Request $request)
     {
         $user = $request->user();
+        if ($user->isSuperAdmin() && $request->filled('company_id')) {
+            $request->validate(['company_id' => 'integer|exists:companies,id']);
+        }
         $companyId = $user->isSuperAdmin() && $request->has('company_id')
             ? $request->company_id
             : ($user->company_id ?? null);
