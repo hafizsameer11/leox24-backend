@@ -131,11 +131,26 @@ class CommunicationController extends Controller
             return false;
         }
 
-        return (new RequestValidator($authToken))->validate(
-            $request->fullUrl(),
-            $request->all(),
-            $signature,
-        );
+        $validator = new RequestValidator($authToken);
+        $parameters = $request->all();
+
+        // Behind a TLS-terminating proxy Laravel can see http:// internally,
+        // while Twilio correctly signs the public https:// callback URL. Check
+        // both the received URL and the explicitly configured public endpoint.
+        $callbackUrls = [$request->fullUrl()];
+        $configuredCallbackUrl = trim((string) config('services.twilio.whatsapp_status_callback_url', ''));
+
+        if ($configuredCallbackUrl !== '') {
+            $callbackUrls[] = $configuredCallbackUrl;
+        }
+
+        foreach (array_unique($callbackUrls) as $callbackUrl) {
+            if ($validator->validate($callbackUrl, $parameters, $signature)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function maskPhoneNumber(string $phoneNumber): string
