@@ -141,7 +141,9 @@ class SetVistaExpressProjectKey extends Command
 
     private function verify(Project $project): int
     {
-        $url = rtrim((string) $project->api_base_url, '/') . '/api/crm/overview';
+        // Use the same URL builder as the service so this check can never
+        // disagree with what the page actually requests.
+        $url = \App\Services\VistaExpressService::apiRoot($project->api_base_url) . '/crm/overview';
 
         $this->line('');
         $this->line('  Live check');
@@ -225,10 +227,15 @@ class SetVistaExpressProjectKey extends Command
 
     private function explain404(): int
     {
-        $this->line('  The server answered, but /api/crm/overview does not exist there.');
-        $this->line('  Confirm the Vista Express backend is deployed with the CRM read-only');
-        $this->line('  namespace and that its migrations have been run: php artisan migrate');
-        $this->line('  Also confirm the base URL points at the API host, not the front end.');
+        $this->line('  The server answered, but that path is not there.');
+        $this->line('  The read-only namespace is mounted from routes/api.php, so it must be');
+        $this->line('  reachable under /api. Confirm on the Vista Express server:');
+        $this->line('');
+        $this->line('    php artisan route:list --path=crm');
+        $this->line('');
+        $this->line('  If that lists api/crm/... routes, the path is right and the deployment is');
+        $this->line('  stale — pull and restart. Also make sure the base URL points at the API');
+        $this->line('  host, not at a front-end domain.');
         $this->line('');
 
         return self::FAILURE;

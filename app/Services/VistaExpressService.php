@@ -27,6 +27,26 @@ class VistaExpressService
     public const KEY_HEADER = 'X-CRM-API-Key';
 
     /**
+     * Resolve the API root for a configured base URL.
+     *
+     * Laravel mounts routes/api.php under an /api prefix, so the read-only
+     * namespace lives at {base}/api/crm/*. Administrators naturally type the
+     * host alone (https://api.vistaexpress.it), so the /api segment is added
+     * when it is missing. A base URL that already ends in /api is left alone,
+     * so both forms work and the project cannot be configured into a 404.
+     */
+    public static function apiRoot(?string $baseUrl): string
+    {
+        $root = rtrim((string) $baseUrl, '/');
+
+        if ($root === '') {
+            return '';
+        }
+
+        return str_ends_with($root, '/api') ? $root : $root . '/api';
+    }
+
+    /**
      * Resources this service is allowed to proxy. The controller validates the
      * requested resource against this list before anything is called.
      *
@@ -79,7 +99,7 @@ class VistaExpressService
         // is what makes this actionable rather than guesswork.
         if (!$project->api_base_url) {
             throw new \RuntimeException(sprintf(
-                'The "%s" project (id %d) has no API Base URL saved. Open Project Management → Projects, edit "%s" and set the API Base URL to the Vista Express server, for example https://api.vistaexpress.it.',
+                'The "%s" project (id %d) has no API Base URL saved. Open Project Management → Projects, edit "%s" and set the API Base URL to the Vista Express API host, for example https://api.vistaexpress.it. The /api segment is added automatically, so both forms work.',
                 $project->name,
                 $project->id,
                 $project->name
@@ -108,7 +128,7 @@ class VistaExpressService
             ->acceptJson()
             ->withHeader(self::KEY_HEADER, $apiKey);
 
-        $url = rtrim($project->api_base_url, '/') . $path;
+        $url = self::apiRoot($project->api_base_url) . $path;
 
         try {
             $response = $client->get($url, $query);
@@ -117,7 +137,7 @@ class VistaExpressService
         }
 
         if (!$response->successful()) {
-            throw new \RuntimeException($this->messageFor($response));
+            throw new \RuntimeException($this->messageFor($response, $url));
         }
 
         $payload = $response->json();
@@ -147,7 +167,7 @@ class VistaExpressService
      * Surface a useful message. The upstream 401/403 cases almost always mean
      * the CRM's key is wrong, expired or lacks the scope, so say so plainly.
      */
-    private function messageFor($response): string
+    private function messageFor($response, string $requestPath = ''): string
     {
         $message = $response->json('message');
 
@@ -158,7 +178,7 @@ class VistaExpressService
         return match ($response->status()) {
             401 => 'Vista Express rejected the CRM API key. Check the key saved in the Projects page. ('.$message.')',
             403 => 'The configured CRM API key is not allowed to read this data. ('.$message.')',
-            404 => 'This Vista Express server does not expose the read-only CRM API. ('.$message.')',
+            404 => 'Vista Express answered but has no read-only CRM API at the expected path. Checked: '.$requestPath.' — the namespace is mounted from routes/api.php, so it must appear under /api. ('.$message.')',
             429 => 'Vista Express is rate limiting this CRM key. Try again shortly.',
             default => $message,
         };
