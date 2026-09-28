@@ -1,0 +1,147 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\Project;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Support\Facades\Crypt;
+use Illuminate\Support\Facades\Http;
+
+/**
+ * Proxies the Opti Amazon / Vista Express read-only CRM API.
+ *
+ * The external project's API key is decrypted here on the CRM server and sent
+ * as an X-CRM-API-Key header. The browser never receives the key, exactly as
+ * with the MyPet Plus integration.
+ *
+ * Every resource lives under {api_base_url}/crm and answers with the
+ * { success, message, data } envelope. Listing money is already normalised to
+ * EUR euros by that API, including the ads subsystem which stores cents
+ * internally, so no conversion is needed on this side.
+ */
+class VistaExpressService
+{
+    /**
+     * Request header carrying the read-only key on the Vista Express side.
+     */
+    public const KEY_HEADER = 'X-CRM-API-Key';
+
+    /**
+     * Resources this service is allowed to proxy. The controller validates the
+     * requested resource against this list before anything is called.
+     *
+     * Nested paths are allowed so the warehouse sub-resources can be reached
+     * without widening the upstream surface any further.
+     */
+    public const RESOURCES = [
+        'overview',
+        'users',
+        'sellers',
+        'products',
+        'orders',
+        'warehouse',
+        'warehouse/products',
+        'warehouse/orders',
+        'ads',
+        'leads',
+    ];
+
+    /**
+     * Call one read-only resource on the configured Vista Express project.
+     *
+     * @param  array<string, mixed>  $filters
+     * @return array<string, mixed> the `data` member of the upstream envelope
+     */
+    public function fetch(Project $project, string $resource, array $filters = []): array
+    {
+        return $this->get($project, '/crm/'.$resource, $this->query($filters));
+    }
+
+    /**
+     * Call a single record, e.g. /crm/orders/1042.
+     *
+     * @return array<string, mixed>
+     */
+    public function fetchOne(Project $project, string $resource, int $id): array
+    {
+        return $this->get($project, '/crm/'.$resource.'/'.$id);
+    }
+
+    /**
+     * @param  array<string, mixed>  $query
+     * @return array<string, mixed>
+     */
+    private function get(Project $project, string $path, array $query = []): array
+    {
+        if (!$project->api_base_url || !$project->api_key) {
+            throw new \RuntimeException(
+                'Vista Express API Base URL and API Key must be configured in the Projects page before this data can be loaded.'
+            );
+        }
+
+        try {
+            $apiKey = Crypt::decryptString($project->api_key);
+        } catch (\Exception $exception) {
+            throw new \RuntimeException('The configured Vista Express API Key could not be decrypted.', 0, $exception);
+        }
+
+        $client = Http::timeout(30)
+            ->acceptJson()
+            ->withHeader(self::KEY_HEADER, $apiKey);
+
+        $url = rtrim($project->api_base_url, '/') . $path;
+
+        try {
+            $response = $client->get($url, $query);
+        } catch (ConnectionException $exception) {
+            throw new \RuntimeException('Unable to reach the Vista Express service.', 0, $exception);
+        }
+
+        if (!$response->successful()) {
+            throw new \RuntimeException($this->messageFor($response));
+        }
+
+        $payload = $response->json();
+
+        if (!is_array($payload) || !($payload['success'] ?? false) || !array_key_exists('data', $payload)) {
+            throw new \RuntimeException('Vista Express returned an invalid response.');
+        }
+
+        return is_array($payload['data']) ? $payload['data'] : ['rows' => $payload['data']];
+    }
+
+    /**
+     * Drop empty values so the upstream API never receives `?search=`.
+     *
+     * @param  array<string, mixed>  $filters
+     * @return array<string, mixed>
+     */
+    private function query(array $filters): array
+    {
+        return array_filter(
+            $filters,
+            fn ($value) => $value !== null && $value !== '' && $value !== []
+        );
+    }
+
+    /**
+     * Surface a useful message. The upstream 401/403 cases almost always mean
+     * the CRM's key is wrong, expired or lacks the scope, so say so plainly.
+     */
+    private function messageFor($response): string
+    {
+        $message = $response->json('message');
+
+        if (!is_string($message) || $message === '') {
+            $message = 'Vista Express rejected the request.';
+        }
+
+        return match ($response->status()) {
+            401 => 'Vista Express rejected the CRM API key. Check the key saved in the Projects page. ('.$message.')',
+            403 => 'The configured CRM API key is not allowed to read this data. ('.$message.')',
+            404 => 'This Vista Express server does not expose the read-only CRM API. ('.$message.')',
+            429 => 'Vista Express is rate limiting this CRM key. Try again shortly.',
+            default => $message,
+        };
+    }
+}

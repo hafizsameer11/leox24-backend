@@ -33,6 +33,7 @@ class ProjectIntegrationService
             'optyshop' => GenericDriver::class, // Will be replaced with OptyShopDriver
             'tg-calabria' => GenericDriver::class,
             'mydoctor' => GenericDriver::class,
+            'vista-express' => GenericDriver::class,
         ];
 
         return $map[$project->slug] ?? GenericDriver::class;

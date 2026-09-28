@@ -26,6 +26,8 @@ use App\Http\Controllers\Api\CategoryController;
 use App\Http\Controllers\Api\MediaController;
 use App\Http\Controllers\Api\SmsController;
 use App\Http\Controllers\Api\MyPetPlusLeadController;
+use App\Http\Controllers\Api\VistaExpressController;
+use App\Services\VistaExpressService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -69,6 +71,14 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/projects/{project}/sso/redirect', [ProjectController::class, 'generateSSORedirect']);
     Route::get('/projects/{project}/iframe-callback', [ProjectController::class, 'iframeCallback']);
     Route::get('/projects/{project}/mypetplus/leads', [MyPetPlusLeadController::class, 'index']);
+
+    // Vista Express (Opti Amazon) read-only business data, proxied through the
+    // project's own API settings. The API key never leaves the CRM server.
+    Route::get('/projects/{project}/vista-express/{resource}', [VistaExpressController::class, 'index'])
+        ->whereIn('resource', array_merge(VistaExpressService::RESOURCES, ['warehouse/products', 'warehouse/orders']));
+    Route::get('/projects/{project}/vista-express/{resource}/{id}', [VistaExpressController::class, 'show'])
+        ->whereIn('resource', ['products', 'orders'])
+        ->whereNumber('id');
 
     // TG Calabria Project
     Route::post('/projects/{projectId}/tg-calabria/login', [\App\Http\Controllers\Api\TGCalabriaController::class, 'login']);

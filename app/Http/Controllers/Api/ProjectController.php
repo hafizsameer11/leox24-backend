@@ -110,13 +110,12 @@ class ProjectController extends Controller
             'is_active' => 'sometimes|boolean',
         ]);
 
-        // Encrypt API credentials if provided
-        if (isset($validated['api_key'])) {
-            $validated['api_key'] = \Illuminate\Support\Facades\Crypt::encryptString($validated['api_key']);
-        }
-        if (isset($validated['api_secret'])) {
-            $validated['api_secret'] = \Illuminate\Support\Facades\Crypt::encryptString($validated['api_secret']);
-        }
+        // Encrypt API credentials if provided. A blank value means "no change"
+        // rather than "store an encrypted empty string", which is what the
+        // Projects screen promises when it labels a key field "leave blank to
+        // keep current" — the form submits the whole object on every save.
+        $this->encryptCredential($validated, 'api_key');
+        $this->encryptCredential($validated, 'api_secret');
 
         $project = Project::create($validated);
 
@@ -159,17 +158,41 @@ class ProjectController extends Controller
             'is_active' => 'sometimes|boolean',
         ]);
 
-        // Encrypt API credentials if provided
-        if (isset($validated['api_key'])) {
-            $validated['api_key'] = \Illuminate\Support\Facades\Crypt::encryptString($validated['api_key']);
-        }
-        if (isset($validated['api_secret'])) {
-            $validated['api_secret'] = \Illuminate\Support\Facades\Crypt::encryptString($validated['api_secret']);
-        }
+        // Encrypt API credentials if provided. Blank values are dropped so an
+        // edit that does not retype a key cannot destroy the stored credential.
+        $this->encryptCredential($validated, 'api_key');
+        $this->encryptCredential($validated, 'api_secret');
 
         $project->update($validated);
 
         return response()->json($project);
+    }
+
+    /**
+     * Encrypt a single project credential in place.
+     *
+     * A missing or whitespace-only value is removed from the payload so it is
+     * simply not written, leaving any existing encrypted value untouched. This
+     * is what allows the Projects form to submit `api_key: ''` on every save
+     * without wiping credentials the administrator entered earlier.
+     *
+     * @param  array<string, mixed>  $validated
+     */
+    private function encryptCredential(array &$validated, string $field): void
+    {
+        if (!array_key_exists($field, $validated)) {
+            return;
+        }
+
+        $value = $validated[$field];
+
+        if ($value === null || (is_string($value) && trim($value) === '')) {
+            unset($validated[$field]);
+
+            return;
+        }
+
+        $validated[$field] = \Illuminate\Support\Facades\Crypt::encryptString((string) $value);
     }
 
     /**
