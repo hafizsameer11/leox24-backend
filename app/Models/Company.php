@@ -44,6 +44,30 @@ class Company extends Model
     }
 
     /**
+     * Lead categories this company is allowed to view/upload.
+     */
+    public function categories()
+    {
+        return $this->belongsToMany(Category::class, 'company_category')
+            ->withTimestamps();
+    }
+
+    /**
+     * Category names granted to this company (for lead filtering).
+     *
+     * @return list<string>
+     */
+    public function allowedLeadCategoryNames(): array
+    {
+        return $this->categories()
+            ->orderBy('name')
+            ->pluck('name')
+            ->filter()
+            ->values()
+            ->all();
+    }
+
+    /**
      * Get the customers for the company.
      */
     public function customers()

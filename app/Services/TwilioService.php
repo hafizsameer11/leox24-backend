@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Call;
 use Illuminate\Support\Facades\Log;
+use App\Support\ItalianPhoneNumber;
 use Twilio\Rest\Client;
 use Twilio\Exceptions\TwilioException;
 
@@ -228,6 +229,8 @@ class TwilioService
             throw new \RuntimeException('Twilio is not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_PHONE_NUMBER.');
         }
 
+        // SMS only to Italian mobiles (national number starting with 3).
+        ItalianPhoneNumber::assertMobileForMessaging($to, 'SMS');
         $to = $this->normalizeE164PhoneNumber($to, 'Recipient phone number');
         $from = $this->verifiedSmsSender();
         $statusCallbackUrl = $this->smsStatusCallbackUrl();
@@ -450,6 +453,8 @@ class TwilioService
             throw new \RuntimeException('Twilio is not configured. Set TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN.');
         }
 
+        // WhatsApp only to Italian mobiles (national number starting with 3).
+        ItalianPhoneNumber::assertMobileForMessaging($to, 'WhatsApp');
         $to = $this->normalizeWhatsAppAddress($to, 'Recipient WhatsApp number');
         $from = $this->normalizeWhatsAppAddress($this->whatsAppNumber, 'TWILIO_WHATSAPP_NUMBER');
         $statusCallbackUrl = $this->whatsAppStatusCallbackUrl();

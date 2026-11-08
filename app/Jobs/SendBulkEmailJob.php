@@ -28,7 +28,8 @@ class SendBulkEmailJob implements ShouldQueue
         public array $attachments = [],
         public ?string $batchId = null,
         public ?string $fromAddress = null,
-        public ?string $fromName = null
+        public ?string $fromName = null,
+        public ?string $mailer = null
     ) {}
 
     /**
@@ -68,14 +69,17 @@ class SendBulkEmailJob implements ShouldQueue
                 ))),
             ]);
 
-            // Send email using Laravel Mailable
-            Mail::to($emailAddress)->send(
+            // Send via the sender's SMTP mailer (Aruba brand mailbox or default Gmail).
+            $mailer = $this->mailer ?: config('mail.default', 'smtp');
+            [$fromAddress, $fromName] = $this->alignedFromIdentity($mailer);
+
+            Mail::mailer($mailer)->to($emailAddress)->send(
                 new BulkEmailMail(
                     $this->subject,
                     $this->message,
                     $this->attachments,
-                    $this->fromAddress,
-                    $this->fromName
+                    $fromAddress,
+                    $fromName
                 )
             );
 
@@ -111,6 +115,35 @@ class SendBulkEmailJob implements ShouldQueue
         }
     }
 
+    /**
+     * Keep From aligned with the authenticated SMTP mailbox to avoid
+     * spoofing signals that push mail into spam.
+     *
+     * @return array{0: string, 1: string}
+     */
+    private function alignedFromIdentity(string $mailer): array
+    {
+        $fromAddress = trim((string) ($this->fromAddress ?: config('mail.from.address')));
+        $fromName = trim((string) ($this->fromName ?: config('mail.from.name', $fromAddress)));
+        $smtpUser = trim((string) config("mail.mailers.{$mailer}.username", ''));
+
+        // Aruba brand mailboxes must authenticate as themselves.
+        // Default Gmail smtp may use a configured From (e.g. noreply@optyshop.com)
+        // if that alias is allowed in the Gmail account.
+        $forceAlign = str_starts_with($mailer, 'aruba_');
+        if ($forceAlign && $smtpUser !== '' && filter_var($smtpUser, FILTER_VALIDATE_EMAIL)
+            && strcasecmp($fromAddress, $smtpUser) !== 0) {
+            Log::warning('Bulk email From overridden to match SMTP username', [
+                'mailer' => $mailer,
+                'requested_from' => $fromAddress,
+                'smtp_username' => $smtpUser,
+            ]);
+            $fromAddress = $smtpUser;
+        }
+
+        return [$fromAddress, $fromName !== '' ? $fromName : $fromAddress];
+    }
+
     private function cleanupBatch(): void
     {
         if (!$this->batchId) {
@@ -120,13 +153,12 @@ class SendBulkEmailJob implements ShouldQueue
         $cacheKey = 'bulk_email:' . $this->batchId . ':pending';
         $remaining = Cache::has($cacheKey) ? Cache::decrement($cacheKey) : null;
 
+        // Delay deletion so parallel workers / retries still find the files.
+        // Immediate delete caused "Bulk email attachment missing" under load.
         if ($remaining !== null && $remaining <= 0) {
-            foreach ($this->attachments as $attachment) {
-                if (!empty($attachment['path'])) {
-                    Storage::disk('local')->delete($attachment['path']);
-                }
-            }
             Cache::forget($cacheKey);
+            CleanupBulkEmailAttachmentsJob::dispatch($this->attachments, $this->batchId)
+                ->delay(now()->addMinutes(15));
         }
     }
 }

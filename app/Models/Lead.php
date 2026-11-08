@@ -16,14 +16,29 @@ class Lead extends Model
     {
         static::addGlobalScope('company', function (Builder $query) {
             $user = auth()->user();
-            if ($user && !$user->isSuperAdmin()) {
-                if ($user->company_id) {
-                    $query->where('company_id', $user->company_id);
-                } else {
-                    // If user has no company_id, only show leads with null company_id
-                    $query->whereNull('company_id');
-                }
+            if (! $user || $user->isSuperAdmin()) {
+                return;
             }
+
+            if (! $user->company_id) {
+                $query->whereNull('company_id');
+
+                return;
+            }
+
+            $allowedCategories = Company::query()
+                ->whereKey($user->company_id)
+                ->first()
+                ?->allowedLeadCategoryNames() ?? [];
+
+            // Clients see leads in their granted categories (including shared
+            // uploads with null company_id), plus leads uploaded for their company.
+            $query->where(function (Builder $inner) use ($user, $allowedCategories) {
+                $inner->where('company_id', $user->company_id);
+                if ($allowedCategories !== []) {
+                    $inner->orWhereIn('category', $allowedCategories);
+                }
+            });
         });
     }
 
@@ -42,6 +57,9 @@ class Lead extends Model
         'intention',
         'source',
         'status',
+        'bulk_email_status',
+        'bulk_email_sent_at',
+        'bulk_email_error',
         'category',
         'file_name',
         'file_format',
@@ -58,6 +76,7 @@ class Lead extends Model
         'raw_attributes' => 'array',
         'date_of_birth' => 'date:Y-m-d',
         'value' => 'decimal:2',
+        'bulk_email_sent_at' => 'datetime',
     ];
 
     public function company(): BelongsTo

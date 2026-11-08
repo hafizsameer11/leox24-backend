@@ -61,6 +61,16 @@ class ProjectSeeder extends Seeder
                 'sso_enabled' => false,
                 'is_active' => true,
             ],
+            [
+                'name' => 'My Beauty',
+                'slug' => 'mybeauty',
+                'description' => 'Beauty salon marketplace platform',
+                'integration_type' => 'api',
+                'api_auth_type' => 'custom',
+                'api_base_url' => 'https://api.mybeutyplus.it/api/v1',
+                'sso_enabled' => false,
+                'is_active' => true,
+            ],
         ];
 
         foreach ($projects as $project) {

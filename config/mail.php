@@ -49,6 +49,54 @@ return [
             'local_domain' => env('MAIL_EHLO_DOMAIN', parse_url((string) env('APP_URL', 'http://localhost'), PHP_URL_HOST)),
         ],
 
+        /*
+        | Aruba business mailboxes for CRM bulk "Mittente" selection.
+        | Host/port shared; each brand authenticates with its own mailbox.
+        */
+        'aruba_mypetplus' => [
+            'transport' => 'smtp',
+            'scheme' => env('ARUBA_MAIL_SCHEME', 'smtp'),
+            'host' => env('ARUBA_MAIL_HOST', 'smtps.aruba.it'),
+            'port' => (int) env('ARUBA_MAIL_PORT', 587),
+            'username' => env('ARUBA_MYPETPLUS_USERNAME', 'info@mypetplus.it'),
+            'password' => env('ARUBA_MYPETPLUS_PASSWORD'),
+            'timeout' => 30,
+            'local_domain' => env('MAIL_EHLO_DOMAIN', parse_url((string) env('APP_URL', 'http://localhost'), PHP_URL_HOST)),
+        ],
+
+        'aruba_vistaexpress' => [
+            'transport' => 'smtp',
+            'scheme' => env('ARUBA_MAIL_SCHEME', 'smtp'),
+            'host' => env('ARUBA_MAIL_HOST', 'smtps.aruba.it'),
+            'port' => (int) env('ARUBA_MAIL_PORT', 587),
+            'username' => env('ARUBA_VISTAEXPRESS_USERNAME', 'info@vistaexpress.it'),
+            'password' => env('ARUBA_VISTAEXPRESS_PASSWORD'),
+            'timeout' => 30,
+            'local_domain' => env('MAIL_EHLO_DOMAIN', parse_url((string) env('APP_URL', 'http://localhost'), PHP_URL_HOST)),
+        ],
+
+        'aruba_mydoctorplus' => [
+            'transport' => 'smtp',
+            'scheme' => env('ARUBA_MAIL_SCHEME', 'smtp'),
+            'host' => env('ARUBA_MAIL_HOST', 'smtps.aruba.it'),
+            'port' => (int) env('ARUBA_MAIL_PORT', 587),
+            'username' => env('ARUBA_MYDOCTORPLUS_USERNAME', 'info@mydoctorplus.it'),
+            'password' => env('ARUBA_MYDOCTORPLUS_PASSWORD'),
+            'timeout' => 30,
+            'local_domain' => env('MAIL_EHLO_DOMAIN', parse_url((string) env('APP_URL', 'http://localhost'), PHP_URL_HOST)),
+        ],
+
+        'aruba_mybeauty' => [
+            'transport' => 'smtp',
+            'scheme' => env('ARUBA_MAIL_SCHEME', 'smtp'),
+            'host' => env('ARUBA_MAIL_HOST', 'smtps.aruba.it'),
+            'port' => (int) env('ARUBA_MAIL_PORT', 587),
+            'username' => env('ARUBA_MYBEAUTY_USERNAME', 'info@mybeutyplus.com'),
+            'password' => env('ARUBA_MYBEAUTY_PASSWORD'),
+            'timeout' => 30,
+            'local_domain' => env('MAIL_EHLO_DOMAIN', parse_url((string) env('APP_URL', 'http://localhost'), PHP_URL_HOST)),
+        ],
+
         'ses' => [
             'transport' => 'ses',
         ],

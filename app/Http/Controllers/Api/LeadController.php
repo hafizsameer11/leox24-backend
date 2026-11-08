@@ -7,6 +7,7 @@ use App\Http\Controllers\Api\Traits\HandlesApiErrors;
 use App\Models\Lead;
 use App\Models\LeadImport;
 use App\Jobs\ProcessLeadImport;
+use App\Support\ItalianPhoneNumber;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -34,16 +35,13 @@ class LeadController extends Controller
             ? $request->company_id
             : ($user->company_id ?? null);
 
-        // Build query based on company_id
-        if ($user->isSuperAdmin() && !$request->has('company_id')) {
-            // Super admin without company_id filter - show all leads
-            $query = Lead::query();
-        } elseif ($companyId === null) {
-            // User with no company_id - show only leads with null company_id
-            $query = Lead::whereNull('company_id');
-        } else {
-            // User with company_id - show only their company's leads
+        // Company scoping for clients is applied by Lead's global scope
+        // (granted categories + own company_id). Super admin can optionally
+        // narrow to one company.
+        if ($user->isSuperAdmin() && $request->filled('company_id')) {
             $query = Lead::where('company_id', $companyId);
+        } else {
+            $query = Lead::query();
         }
 
         // Apply search filter (includes JSON file body for legacy "one row = whole file" leads)
@@ -61,9 +59,13 @@ class LeadController extends Controller
             $query->where('source', $request->source);
         }
 
-        // Apply category filter
+        // Apply category filter (clients may only choose categories they can access)
         if ($request->has('category') && $request->category !== 'all') {
-            $query->where('category', $request->category);
+            $category = (string) $request->category;
+            if (! $user->isSuperAdmin() && ! $this->userCanAccessLeadCategory($user, $category)) {
+                return response()->json(['message' => 'Access denied for this category.'], 403);
+            }
+            $query->where('category', $category);
         }
 
         $this->applyLeadFieldFilters($query, $request);
@@ -372,7 +374,13 @@ class LeadController extends Controller
         // The extension is authoritative so a stale/missing UI format value
         // cannot cause an Excel workbook to be sent through the CSV parser.
         $format = in_array($extension, ['csv', 'txt'], true) ? 'csv' : 'excel';
-        $category = $request->input('category');
+        $category = (string) $request->input('category');
+
+        if (! $user->isSuperAdmin() && ! $this->userCanAccessLeadCategory($user, $category)) {
+            throw ValidationException::withMessages([
+                'category' => ['You can only upload leads into categories granted to your company.'],
+            ]);
+        }
 
         $storedPath = null;
         try {
@@ -505,26 +513,30 @@ class LeadController extends Controller
                     $insertRows[] = [
                         'lead_import_id' => $import->id,
                         'company_id' => $import->company_id,
-                        'name' => $mapped['name'],
-                        'email' => $mapped['email'],
-                        'phone' => $mapped['phone'],
-                        'mobile' => $mapped['mobile'],
-                        'age' => $mapped['age'],
-                        'gender' => $mapped['gender'],
-                        'country' => $mapped['country'],
-                        'city' => $mapped['city'],
+                        // Match DB varchar limits so one oversized cell cannot
+                        // abort the whole chunk (and leave the import stuck).
+                        'name' => $this->limitImportString($mapped['name'], 255),
+                        'email' => $this->limitImportString($mapped['email'], 255),
+                        'phone' => $this->limitImportString($mapped['phone'], 255),
+                        'mobile' => $this->limitImportString($mapped['mobile'], 255),
+                        'age' => $this->limitImportString($mapped['age'], 20),
+                        'gender' => $this->limitImportString($mapped['gender'], 100),
+                        'country' => $this->limitImportString($mapped['country'], 100),
+                        'city' => $this->limitImportString($mapped['city'], 120),
                         'date_of_birth' => $mapped['date_of_birth'],
-                        'intention' => $mapped['intention'],
-                        'source' => 'import:'.$import->file_name,
+                        'intention' => $this->limitImportString($mapped['intention'], 255),
+                        'source' => $this->limitImportString('import:'.$import->file_name, 255),
                         'status' => 'cold',
-                        'category' => $import->category,
-                        'file_name' => $import->file_name,
-                        'file_format' => $import->file_format,
+                        'category' => $this->limitImportString($import->category, 255),
+                        'file_name' => $this->limitImportString($import->file_name, 255),
+                        'file_format' => $this->limitImportString($import->file_format, 255),
                         'file_headers' => null,
                         'file_records' => null,
-                        'raw_attributes' => json_encode($mapped['raw_attributes']),
+                        'raw_attributes' => json_encode(
+                            $this->limitImportAttributes($mapped['raw_attributes'] ?? [])
+                        ),
                         'value' => null,
-                        'assigned_to' => (string) $import->user_id,
+                        'assigned_to' => $this->limitImportString((string) $import->user_id, 255),
                         'created_at' => now(),
                         'updated_at' => now(),
                     ];
@@ -571,21 +583,148 @@ class LeadController extends Controller
         if (! $import) {
             return;
         }
-        Lead::where('lead_import_id', $importId)->delete();
-        $import->update([
-            'status' => 'failed',
-            'error_message' => $exception->getMessage(),
-            'completed_at' => now(),
-        ]);
-        if (Storage::exists($import->stored_path)) {
-            Storage::delete($import->stored_path);
+
+        // Never rethrow from failure handling: a secondary DB error here used
+        // to leave imports stuck in "processing" while the UI polled for minutes.
+        try {
+            Lead::where('lead_import_id', $importId)->delete();
+        } catch (\Throwable $cleanupError) {
+            Log::warning('Lead import cleanup failed after job error', [
+                'import_id' => $importId,
+                'error' => $cleanupError->getMessage(),
+            ]);
         }
+
+        $message = $this->summarizeImportException($exception);
+
+        try {
+            $import->update([
+                'status' => 'failed',
+                'error_message' => $message,
+                'completed_at' => now(),
+            ]);
+        } catch (\Throwable $statusError) {
+            Log::error('Lead import could not be marked failed', [
+                'import_id' => $importId,
+                'original_error' => $message,
+                'status_error' => $statusError->getMessage(),
+            ]);
+            try {
+                DB::table('lead_imports')->where('id', $importId)->update([
+                    'status' => 'failed',
+                    'error_message' => mb_substr($message, 0, 500),
+                    'completed_at' => now(),
+                    'updated_at' => now(),
+                ]);
+            } catch (\Throwable $ignored) {
+                // Last resort already logged above.
+            }
+        }
+
+        try {
+            if ($import->stored_path && Storage::exists($import->stored_path)) {
+                Storage::delete($import->stored_path);
+            }
+        } catch (\Throwable $ignored) {
+        }
+
         Log::error('Lead import job failed', [
             'import_id' => $importId,
             'file_name' => $import->file_name,
-            'error' => $exception->getMessage(),
+            'error' => $message,
             'exception' => get_class($exception),
         ]);
+    }
+
+    /** Keep import failure text short enough for lead_imports.error_message. */
+    private function summarizeImportException(\Throwable $exception): string
+    {
+        $message = trim((string) $exception->getMessage());
+        if ($message === '') {
+            return get_class($exception);
+        }
+
+        // Prefer the actionable MySQL column hint over the full SQL dump.
+        if (preg_match("/Data too long for column '([^']+)'/", $message, $match)) {
+            return "Data too long for column '{$match[1]}'. Shorten that field in the spreadsheet and try again.";
+        }
+
+        if (preg_match('/SQLSTATE\[(.*?)\]:\s*([^\(]+)/', $message, $match)) {
+            return trim('SQLSTATE['.$match[1].']: '.$match[2]);
+        }
+
+        return mb_substr($message, 0, 1000);
+    }
+
+    private function limitImportString(mixed $value, int $max): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+        $string = trim((string) $value);
+        if ($string === '') {
+            return null;
+        }
+
+        return mb_strlen($string) > $max ? mb_substr($string, 0, $max) : $string;
+    }
+
+    /**
+     * Keep imported spreadsheet extras, but cap each value so one huge cell
+     * (e.g. a 500+ char Category dump) cannot break the insert.
+     *
+     * @param  array<string, mixed>  $attributes
+     * @return array<string, string>
+     */
+    private function limitImportAttributes(array $attributes): array
+    {
+        $limited = [];
+        foreach ($attributes as $key => $value) {
+            $label = trim((string) $key);
+            if ($label === '' || $value === null) {
+                continue;
+            }
+            $string = trim((string) $value);
+            if ($string === '') {
+                continue;
+            }
+            $limited[mb_substr($label, 0, 120)] = mb_strlen($string) > 500
+                ? mb_substr($string, 0, 500)
+                : $string;
+        }
+
+        return $limited;
+    }
+
+    private function userCanAccessLeadCategory($user, string $category): bool
+    {
+        if ($user->isSuperAdmin()) {
+            return true;
+        }
+        if (! $user->company_id) {
+            return false;
+        }
+
+        $allowed = \App\Models\Company::query()
+            ->whereKey($user->company_id)
+            ->first()
+            ?->allowedLeadCategoryNames() ?? [];
+
+        return in_array($category, $allowed, true);
+    }
+
+    private function assertCanAccessLead($user, Lead $lead): void
+    {
+        if ($user->isSuperAdmin()) {
+            return;
+        }
+        if ($user->company_id && (int) $lead->company_id === (int) $user->company_id) {
+            return;
+        }
+        if ($lead->category && $this->userCanAccessLeadCategory($user, (string) $lead->category)) {
+            return;
+        }
+        abort(403, 'Access denied');
     }
 
     /**
@@ -689,7 +828,7 @@ class LeadController extends Controller
         }
 
         // If a file has two generic phone columns, preserve the second one as
-        // mobile rather than overwriting the primary phone value.
+        // a candidate — Italian digit rules decide landline vs mobile below.
         if ($phone !== null && $mobile === null) {
             foreach ($normPairs as $pair) {
                 if ($pair['value'] === '' || ! $this->headerLooksLikePhone($pair['norm'])) {
@@ -702,6 +841,11 @@ class LeadController extends Controller
                 }
             }
         }
+
+        // Piero rule: landlines (0…) → Telephone; mobiles (3…) → Mobile.
+        $separated = ItalianPhoneNumber::separate($phone, $mobile);
+        $phone = $separated['phone'];
+        $mobile = $separated['mobile'];
 
         $dateOfBirth = $this->firstImportValue($normPairs, fn (string $norm): bool => $this->headerLooksLikeDateOfBirth($norm));
         $normalizedDateOfBirth = $this->normalizeDateOfBirth($dateOfBirth);
@@ -1054,7 +1198,9 @@ class LeadController extends Controller
     }
 
     /**
-     * Prefer ';' when it yields more columns than ',' (common for EU / Italian CSV).
+     * Choose CSV delimiter from a header line.
+     * Prefer the delimiter that yields real CRM headers (Name/Email/Phone).
+     * Italian Excel often uses ';', while Piro exports use ','.
      */
     private function detectCsvDelimiter(string $firstLine): string
     {
@@ -1063,14 +1209,171 @@ class LeadController extends Controller
         if ($firstLine === '') {
             return ',';
         }
-        $commaCols = count(str_getcsv($firstLine, ','));
-        $semiCols = count(str_getcsv($firstLine, ';'));
-
-        if ($semiCols > $commaCols && $semiCols > 1) {
-            return ';';
+        // Excel often prepends "sep=;" or "sep=,".
+        if (preg_match('/^sep=(.)$/i', $firstLine, $match)) {
+            return $match[1];
         }
 
-        return ',';
+        $scores = [];
+        foreach ([',', ';', "\t"] as $delimiter) {
+            $cols = str_getcsv($firstLine, $delimiter);
+            $norms = array_map(fn ($h) => $this->normalizeHeaderToken($this->convertToUtf8((string) $h)), $cols);
+            $score = count($cols);
+            if ($this->headersLookLikeLeadCsv($norms)) {
+                $score += 100;
+            }
+            $scores[$delimiter] = $score;
+        }
+
+        arsort($scores);
+        $best = array_key_first($scores);
+
+        return is_string($best) && ($scores[$best] ?? 0) > 1 ? $best : ',';
+    }
+
+    /**
+     * @param  list<string>  $norms
+     */
+    private function headersLookLikeLeadCsv(array $norms): bool
+    {
+        $joined = ' '.implode(' ', $norms).' ';
+        $hasName = str_contains($joined, ' name ') || str_contains($joined, ' nome ') || str_contains($joined, ' company ');
+        $hasContact = str_contains($joined, ' email ') || str_contains($joined, ' phone ') || str_contains($joined, ' telefono ') || str_contains($joined, ' mail ');
+
+        return $hasName && $hasContact;
+    }
+
+    /**
+     * True when rows were collapsed into column 0 (wrong delimiter), e.g. whole CSV line in Name.
+     *
+     * @param  list<string>  $headers
+     * @param  list<list<string>>  $records
+     */
+    private function csvLooksCollapsed(array $headers, array $records): bool
+    {
+        if ($records === []) {
+            return false;
+        }
+        $sample = array_slice($records, 0, min(30, count($records)));
+        $collapsed = 0;
+        foreach ($sample as $row) {
+            if ($this->rowLooksCollapsed($row)) {
+                $collapsed++;
+            }
+        }
+
+        return $collapsed >= max(1, (int) floor(count($sample) * 0.5));
+    }
+
+    /**
+     * @param  list<string>  $row
+     */
+    private function rowLooksCollapsed(array $row): bool
+    {
+        $nonEmpty = 0;
+        foreach ($row as $cell) {
+            if (trim((string) $cell) !== '') {
+                $nonEmpty++;
+            }
+        }
+        $first = trim((string) ($row[0] ?? ''));
+
+        return $nonEmpty <= 1
+            && (substr_count($first, ',') >= 3 || substr_count($first, ';') >= 3);
+    }
+
+    /**
+     * Split a collapsed first-cell CSV line back into real columns.
+     *
+     * @param  list<string>  $headers
+     * @param  list<list<string>>  $records
+     * @return list<list<string>>
+     */
+    private function repairCollapsedCsvRecords(array $headers, array $records): array
+    {
+        $headerCount = max(1, count($headers));
+        $repaired = [];
+
+        foreach ($records as $row) {
+            if (! $this->rowLooksCollapsed($row)) {
+                $repaired[] = $row;
+                continue;
+            }
+
+            $blob = trim((string) ($row[0] ?? ''));
+            $parts = null;
+            foreach ([',', ';'] as $delimiter) {
+                $candidate = str_getcsv($blob, $delimiter);
+                if (count($candidate) >= min(4, $headerCount)) {
+                    $parts = $candidate;
+                    break;
+                }
+            }
+            if ($parts === null) {
+                $repaired[] = $row;
+                continue;
+            }
+
+            while (count($parts) < $headerCount) {
+                $parts[] = '';
+            }
+            if (count($parts) > $headerCount) {
+                $parts = array_slice($parts, 0, $headerCount);
+            }
+            $repaired[] = array_map(fn ($cell) => $this->convertToUtf8((string) $cell), $parts);
+        }
+
+        return $repaired;
+    }
+
+    /**
+     * @return array{headers: list<string>, records: list<list<string>>}
+     */
+    private function parseCsvWithDelimiter(string $path, string $delimiter): array
+    {
+        $handle = fopen($path, 'r');
+        if ($handle === false) {
+            throw new \Exception('Unable to open CSV file');
+        }
+
+        try {
+            $firstLine = fgets($handle);
+            if ($firstLine !== false && preg_match('/^sep=/i', ltrim(str_replace("\xEF\xBB\xBF", '', $firstLine)))) {
+                // Excel preamble like "sep=;" — skip it and keep chosen delimiter.
+            } else {
+                rewind($handle);
+            }
+
+            $headers = fgetcsv($handle, null, $delimiter);
+            if ($headers === false) {
+                throw new \Exception('Unable to read headers from CSV file');
+            }
+
+            $headers = array_map(function ($header) {
+                return trim(str_replace("\xEF\xBB\xBF", '', $this->convertToUtf8($header)));
+            }, $headers);
+
+            $records = [];
+            while (($row = fgetcsv($handle, null, $delimiter)) !== false) {
+                if (! array_filter($row, fn ($cell) => trim((string) $cell) !== '')) {
+                    continue;
+                }
+                $row = array_map(function ($cell) {
+                    return $this->convertToUtf8($cell);
+                }, $row);
+                while (count($row) < count($headers)) {
+                    $row[] = '';
+                }
+                if (count($row) > count($headers)) {
+                    $row = array_slice($row, 0, count($headers));
+                }
+                $records[] = $row;
+            }
+
+            return ['headers' => $headers, 'records' => $records];
+        } finally {
+            fclose($handle);
+        }
     }
 
     /**
@@ -1084,50 +1387,40 @@ class LeadController extends Controller
         if ($format === 'csv') {
             $path = $file->getRealPath();
             $handle = fopen($path, 'r');
-            if ($handle !== false) {
-                $firstLine = fgets($handle);
-                if ($firstLine === false) {
-                    fclose($handle);
-                    throw new \Exception('Unable to read CSV file');
-                }
-                $delimiter = $this->detectCsvDelimiter($firstLine);
-                rewind($handle);
-
-                // Get headers (first row)
-                $headers = fgetcsv($handle, 0, $delimiter);
-                if ($headers === false) {
-                    fclose($handle);
-                    throw new \Exception('Unable to read headers from CSV file');
-                }
-
-                // Clean headers - remove BOM, convert to UTF-8, and trim whitespace
-                $headers = array_map(function ($header) {
-                    return $this->convertToUtf8($header);
-                }, $headers);
-
-                // Get records
-                while (($row = fgetcsv($handle, 0, $delimiter)) !== false) {
-                    // Only add if row has data
-                    if (array_filter($row)) {
-                        // Convert each cell to UTF-8
-                        $row = array_map(function ($cell) {
-                            return $this->convertToUtf8($cell);
-                        }, $row);
-
-                        // Ensure row has same number of columns as headers (pad or trim)
-                        while (count($row) < count($headers)) {
-                            $row[] = '';
-                        }
-                        if (count($row) > count($headers)) {
-                            $row = array_slice($row, 0, count($headers));
-                        }
-                        $records[] = $row;
-                    }
-                }
-                fclose($handle);
-            } else {
+            if ($handle === false) {
                 throw new \Exception('Unable to open CSV file');
             }
+            $firstLine = fgets($handle);
+            fclose($handle);
+            if ($firstLine === false) {
+                throw new \Exception('Unable to read CSV file');
+            }
+
+            $delimiter = $this->detectCsvDelimiter($firstLine);
+            $parsed = $this->parseCsvWithDelimiter($path, $delimiter);
+
+            // If Excel/locale sniffer picked ';' but the file is comma CSV (Piro),
+            // every row collapses into Name. Detect and re-parse with ','.
+            if ($delimiter !== ',' && $this->csvLooksCollapsed($parsed['headers'], $parsed['records'])) {
+                $parsed = $this->parseCsvWithDelimiter($path, ',');
+            } elseif ($delimiter === ',' && $this->csvLooksCollapsed($parsed['headers'], $parsed['records'])) {
+                $retry = $this->parseCsvWithDelimiter($path, ';');
+                if (! $this->csvLooksCollapsed($retry['headers'], $retry['records'])) {
+                    $parsed = $retry;
+                }
+            }
+
+            // Last resort: header columns are fine but each data row was stored as
+            // one quoted cell containing the full comma/semicolon CSV line.
+            if ($this->csvLooksCollapsed($parsed['headers'], $parsed['records'])) {
+                $parsed['records'] = $this->repairCollapsedCsvRecords(
+                    $parsed['headers'],
+                    $parsed['records']
+                );
+            }
+
+            $headers = $parsed['headers'];
+            $records = $parsed['records'];
         } else {
             // Excel format using PhpSpreadsheet
             try {
@@ -1498,12 +1791,7 @@ class LeadController extends Controller
      */
     public function show(Request $request, Lead $lead)
     {
-        $user = $request->user();
-
-        // Check access
-        if (!$user->isSuperAdmin() && $lead->company_id !== $user->company_id) {
-            abort(403, 'Access denied');
-        }
+        $this->assertCanAccessLead($request->user(), $lead);
 
         return response()->json($lead);
     }
@@ -1514,17 +1802,18 @@ class LeadController extends Controller
     public function update(Request $request, Lead $lead)
     {
         $user = $request->user();
-
-        // Check access
-        if (!$user->isSuperAdmin() && $lead->company_id !== $user->company_id) {
-            abort(403, 'Access denied');
-        }
+        $this->assertCanAccessLead($user, $lead);
 
         $validated = $request->validate([
             'status' => 'sometimes|string',
             'category' => 'sometimes|string',
             'assigned_to' => 'sometimes|exists:users,id',
         ]);
+
+        if (isset($validated['category']) && ! $user->isSuperAdmin()
+            && ! $this->userCanAccessLeadCategory($user, (string) $validated['category'])) {
+            abort(403, 'Access denied for this category');
+        }
 
         $lead->update($validated);
 
@@ -1536,12 +1825,7 @@ class LeadController extends Controller
      */
     public function destroy(Request $request, Lead $lead)
     {
-        $user = $request->user();
-
-        // Check access
-        if (!$user->isSuperAdmin() && $lead->company_id !== $user->company_id) {
-            abort(403, 'Access denied');
-        }
+        $this->assertCanAccessLead($request->user(), $lead);
 
         $lead->delete();
 
@@ -1561,13 +1845,10 @@ class LeadController extends Controller
             ? $request->company_id
             : ($user->company_id ?? null);
 
-        // Build query based on company_id (same as index method)
-        if ($user->isSuperAdmin() && !$request->has('company_id')) {
-            $query = Lead::query();
-        } elseif ($companyId === null) {
-            $query = Lead::whereNull('company_id');
-        } else {
+        if ($user->isSuperAdmin() && $request->filled('company_id')) {
             $query = Lead::where('company_id', $companyId);
+        } else {
+            $query = Lead::query();
         }
 
         // Apply filters (same as index method)
@@ -1584,7 +1865,11 @@ class LeadController extends Controller
         }
 
         if ($request->has('category') && $request->category !== 'all') {
-            $query->where('category', $request->category);
+            $category = (string) $request->category;
+            if (! $user->isSuperAdmin() && ! $this->userCanAccessLeadCategory($user, $category)) {
+                abort(403, 'Access denied for this category');
+            }
+            $query->where('category', $category);
         }
 
         $this->applyLeadFieldFilters($query, $request);

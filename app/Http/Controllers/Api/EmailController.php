@@ -5,7 +5,10 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Http\Controllers\Api\Traits\HandlesApiErrors;
 use App\Models\Email;
+use App\Models\Lead;
 use App\Jobs\SendBulkEmailJob;
+use App\Jobs\SendLeadBulkEmailJob;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
@@ -23,8 +26,20 @@ class EmailController extends Controller
      */
     public function senders()
     {
+        // Never expose mailer credentials — only public From identity fields.
+        $senders = collect(config('email_senders.senders', []))
+            ->map(fn (array $sender) => [
+                'id' => $sender['id'] ?? '',
+                'label' => $sender['label'] ?? ($sender['name'] ?? ''),
+                'address' => $sender['address'] ?? '',
+                'name' => $sender['name'] ?? '',
+            ])
+            ->filter(fn (array $sender) => $sender['id'] !== '' && $sender['address'] !== '')
+            ->values()
+            ->all();
+
         return response()->json([
-            'senders' => config('email_senders.senders', []),
+            'senders' => $senders,
         ]);
     }
 
@@ -69,6 +84,28 @@ class EmailController extends Controller
     }
 
     /**
+     * Distinct categories actually used on email records (for filter / send UI).
+     */
+    public function categories()
+    {
+        $rows = Email::query()
+            ->selectRaw('category, COUNT(*) as total, SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) as active_count', ['active'])
+            ->whereNotNull('category')
+            ->where('category', '!=', '')
+            ->groupBy('category')
+            ->orderBy('category')
+            ->get();
+
+        return response()->json([
+            'categories' => $rows->map(fn ($row) => [
+                'name' => $row->category,
+                'total' => (int) $row->total,
+                'active_count' => (int) $row->active_count,
+            ])->values(),
+        ]);
+    }
+
+    /**
      * List all emails with pagination and filtering
      */
     public function index(Request $request)
@@ -85,16 +122,26 @@ class EmailController extends Controller
             $query->where('status', $request->status);
         }
 
-        // Search by email address (search in row_data_json)
-        if ($request->has('search') && $request->search) {
-            $search = $request->search;
-            $query->where(function ($q) use ($search) {
-                $q->whereJsonContains('row_data_json->email', $search)
-                  ->orWhere('category', 'like', "%{$search}%");
+        // Partial search on address / category / payload email
+        if ($request->filled('search')) {
+            $term = '%' . addcslashes(trim((string) $request->search), '%_\\') . '%';
+            $query->where(function ($q) use ($term) {
+                $q->where('email_address', 'like', $term)
+                    ->orWhere('category', 'like', $term)
+                    ->orWhere('error_message', 'like', $term)
+                    ->orWhereRaw(
+                        "JSON_UNQUOTE(JSON_EXTRACT(row_data_json, '$.email')) LIKE ?",
+                        [$term]
+                    );
             });
         }
 
-        $emails = $query->latest()->paginate($request->get('per_page', 15));
+        // Recently sent / updated first (NULL sent_at sinks below)
+        $emails = $query
+            ->orderByDesc('sent_at')
+            ->orderByDesc('updated_at')
+            ->orderByDesc('id')
+            ->paginate($request->get('per_page', 15));
 
         return response()->json($emails);
     }
@@ -573,11 +620,14 @@ class EmailController extends Controller
             'subject' => 'required|string|max:255',
             'message' => 'required|string',
             'sender_id' => 'nullable|string|max:100',
+            // category = pick category + optional range (e.g. 1-30); selected = table checkboxes
             'selection_type' => 'required|in:first_n,selected,category',
-            'first_n' => 'required_if:selection_type,first_n|integer|min:1',
+            'first_n' => 'nullable|integer|min:1',
             'selected_ids' => 'required_if:selection_type,selected|array',
             'selected_ids.*' => 'integer|exists:emails,id',
-            'category_filter' => 'required_if:selection_type,category|string',
+            'category_filter' => 'required_if:selection_type,category|required_if:selection_type,first_n|string',
+            'range_from' => 'nullable|integer|min:1',
+            'range_to' => 'nullable|integer|min:1|gte:range_from',
             'attachments' => 'nullable|array',
             'attachments.*' => 'file|max:102400|mimes:pdf,xls,xlsx,doc,docx,jpg,jpeg,png',
         ]);
@@ -600,26 +650,23 @@ class EmailController extends Controller
                 }
             }
 
-            // Build query based on selection type
+            $selectionType = $validated['selection_type'];
             $query = Email::query();
 
-            switch ($validated['selection_type']) {
-                case 'first_n':
-                    // For first N, only get active emails
-                    $query->where('status', 'active')
-                          ->limit($validated['first_n']);
-                    break;
-                
-                case 'selected':
-                    // For manually selected, allow any status (user explicitly selected these)
-                    $query->whereIn('id', $validated['selected_ids']);
-                    break;
-                
-                case 'category':
-                    // For category filter, only get active emails
-                    $query->where('status', 'active')
-                          ->where('category', $validated['category_filter']);
-                    break;
+            if ($selectionType === 'selected') {
+                $query->whereIn('id', $validated['selected_ids']);
+            } else {
+                // category / first_n: active emails in the chosen category (same labels as table)
+                $category = $validated['category_filter'] ?? '';
+                if ($category === '') {
+                    return response()->json([
+                        'message' => 'Category is required',
+                    ], 422);
+                }
+
+                $query->where('status', 'active')
+                    ->where('category', $category)
+                    ->orderBy('id');
             }
 
             $emails = $query->get()->unique(function (Email $email) {
@@ -632,6 +679,27 @@ class EmailController extends Controller
                     ? strtolower(trim((string) $data['email']))
                     : 'id:' . $email->id;
             })->values();
+
+            // Category send: apply 1-based range (e.g. 1-30). first_n maps to 1..N.
+            if ($selectionType !== 'selected') {
+                $from = (int) ($validated['range_from'] ?? 1);
+                $to = (int) ($validated['range_to'] ?? 0);
+
+                if ($selectionType === 'first_n' && $to < 1) {
+                    $to = (int) ($validated['first_n'] ?? 20);
+                    $from = 1;
+                }
+
+                if ($from < 1) {
+                    $from = 1;
+                }
+                if ($to < $from) {
+                    // No upper bound provided → send all in category
+                    $to = $emails->count();
+                }
+
+                $emails = $emails->slice($from - 1, $to - $from + 1)->values();
+            }
 
             if ($emails->isEmpty()) {
                 return response()->json([
@@ -652,7 +720,11 @@ class EmailController extends Controller
 
             $sender = $this->resolveSender($validated['sender_id'] ?? null);
             $fromAddress = $sender['address'] ?? config('mail.from.address');
-            $fromName = $sender['name'] ?? config('mail.from.name');
+            // Prefer the Mittente title (label/name) — never a generic brand fallback.
+            $fromName = $sender['name']
+                ?? $sender['label']
+                ?? config('mail.from.name');
+            $mailer = $sender['mailer'] ?? config('mail.default', 'smtp');
 
             // Dispatch job for each email (or batch them)
             foreach ($emails as $email) {
@@ -664,7 +736,8 @@ class EmailController extends Controller
                         $attachments,
                         $batchId,
                         $fromAddress,
-                        $fromName
+                        $fromName,
+                        $mailer
                     );
                     $sentCount++;
                 } catch (\Exception $e) {
@@ -689,5 +762,215 @@ class EmailController extends Controller
                 'message' => 'Failed to send emails: ' . $e->getMessage()
             ], 500);
         }
+    }
+
+    /**
+     * Leads that have a usable email address (for "Emails from leads" tab).
+     */
+    public function leadEmails(Request $request)
+    {
+        $query = $this->leadsWithEmailQuery();
+
+        if ($request->filled('category') && $request->category !== 'all') {
+            $query->where('category', $request->category);
+        }
+
+        if ($request->filled('status') && $request->status !== 'all') {
+            if ($request->status === 'pending') {
+                $query->where(function (Builder $q) {
+                    $q->whereNull('bulk_email_status')
+                        ->orWhere('bulk_email_status', '');
+                });
+            } else {
+                $query->where('bulk_email_status', $request->status);
+            }
+        }
+
+        if ($request->filled('search')) {
+            $term = '%' . addcslashes(trim((string) $request->search), '%_\\') . '%';
+            $query->where(function (Builder $q) use ($term) {
+                $q->where('email', 'like', $term)
+                    ->orWhere('name', 'like', $term)
+                    ->orWhere('category', 'like', $term);
+            });
+        }
+
+        // Pending first (ready to send), then failed, then sent; newest IDs on top.
+        $leads = $query
+            ->orderByRaw("CASE
+                WHEN bulk_email_status IS NULL OR bulk_email_status = '' THEN 0
+                WHEN bulk_email_status = 'failed' THEN 1
+                ELSE 2
+            END")
+            ->orderByDesc('id')
+            ->paginate($request->get('per_page', 15));
+
+        return response()->json($leads);
+    }
+
+    /**
+     * Distinct lead categories among leads that have an email.
+     */
+    public function leadEmailCategories()
+    {
+        $rows = $this->leadsWithEmailQuery()
+            ->selectRaw(
+                "category,
+                COUNT(*) as total,
+                SUM(CASE WHEN bulk_email_status IS NULL OR bulk_email_status = '' THEN 1 ELSE 0 END) as pending_count,
+                SUM(CASE WHEN bulk_email_status = 'sent' THEN 1 ELSE 0 END) as sent_count"
+            )
+            ->whereNotNull('category')
+            ->where('category', '!=', '')
+            ->groupBy('category')
+            ->orderBy('category')
+            ->get();
+
+        return response()->json([
+            'categories' => $rows->map(fn ($row) => [
+                'name' => $row->category,
+                'total' => (int) $row->total,
+                'pending_count' => (int) $row->pending_count,
+                'sent_count' => (int) $row->sent_count,
+                'active_count' => (int) $row->pending_count,
+            ])->values(),
+        ]);
+    }
+
+    /**
+     * Queue bulk emails to leads (category + range, or manual selection).
+     */
+    public function sendFromLeads(Request $request)
+    {
+        $validated = $request->validate([
+            'subject' => 'required|string|max:255',
+            'message' => 'required|string',
+            'sender_id' => 'nullable|string|max:100',
+            'selection_type' => 'required|in:selected,category',
+            'selected_ids' => 'required_if:selection_type,selected|array',
+            'selected_ids.*' => 'integer|exists:leads,id',
+            'category_filter' => 'required_if:selection_type,category|string',
+            'range_from' => 'nullable|integer|min:1',
+            'range_to' => 'nullable|integer|min:1|gte:range_from',
+            'attachments' => 'nullable|array',
+            'attachments.*' => 'file|max:102400|mimes:pdf,xls,xlsx,doc,docx,jpg,jpeg,png',
+        ]);
+
+        try {
+            $attachments = [];
+            $batchId = null;
+
+            if ($request->hasFile('attachments')) {
+                $batchId = (string) Str::uuid();
+                $attachmentsDir = 'bulk-email/' . $batchId;
+
+                foreach ($request->file('attachments') as $attachment) {
+                    $path = $attachment->store($attachmentsDir, 'local');
+                    $attachments[] = [
+                        'path' => $path,
+                        'name' => $attachment->getClientOriginalName(),
+                        'mime' => $attachment->getClientMimeType(),
+                    ];
+                }
+            }
+
+            $query = $this->leadsWithEmailQuery();
+
+            if ($validated['selection_type'] === 'selected') {
+                $query->whereIn('id', $validated['selected_ids']);
+            } else {
+                $query->where('category', $validated['category_filter'])
+                    ->where(function (Builder $q) {
+                        $q->whereNull('bulk_email_status')
+                            ->orWhere('bulk_email_status', '')
+                            ->orWhere('bulk_email_status', 'failed');
+                    })
+                    ->orderBy('id');
+            }
+
+            $leads = $query->get()->unique(function (Lead $lead) {
+                return strtolower(trim((string) $lead->email));
+            })->values();
+
+            if ($validated['selection_type'] === 'category') {
+                $from = max(1, (int) ($validated['range_from'] ?? 1));
+                $to = (int) ($validated['range_to'] ?? 0);
+                if ($to < $from) {
+                    $to = $leads->count();
+                }
+                $leads = $leads->slice($from - 1, $to - $from + 1)->values();
+            }
+
+            if ($leads->isEmpty()) {
+                return response()->json([
+                    'message' => 'No leads with email found matching the criteria',
+                ], 404);
+            }
+
+            if ($batchId) {
+                Cache::put(
+                    'bulk_email:' . $batchId . ':pending',
+                    $leads->count(),
+                    now()->addHours(6)
+                );
+            }
+
+            $sender = $this->resolveSender($validated['sender_id'] ?? null);
+            $fromAddress = $sender['address'] ?? config('mail.from.address');
+            $fromName = $sender['name']
+                ?? $sender['label']
+                ?? config('mail.from.name');
+            $mailer = $sender['mailer'] ?? config('mail.default', 'smtp');
+
+            $queued = 0;
+            $failed = 0;
+
+            foreach ($leads as $lead) {
+                try {
+                    SendLeadBulkEmailJob::dispatch(
+                        $lead->id,
+                        $validated['subject'],
+                        $validated['message'],
+                        $attachments,
+                        $batchId,
+                        $fromAddress,
+                        $fromName,
+                        $mailer
+                    );
+                    $queued++;
+                } catch (\Exception $e) {
+                    $failed++;
+                    Log::error('Failed to queue lead email', [
+                        'lead_id' => $lead->id,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+
+            return response()->json([
+                'message' => 'Emails queued for sending',
+                'total' => $leads->count(),
+                'queued' => $queued,
+                'failed' => $failed,
+            ], 200);
+        } catch (\Exception $e) {
+            Log::error('Bulk lead email send failed', ['error' => $e->getMessage()]);
+
+            return response()->json([
+                'message' => 'Failed to send emails: ' . $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /**
+     * Leads with a non-empty email-looking address.
+     */
+    private function leadsWithEmailQuery(): Builder
+    {
+        return Lead::query()
+            ->whereNotNull('email')
+            ->where('email', '!=', '')
+            ->where('email', 'like', '%@%.%')
+            ->where('email', 'not like', '% %');
     }
 }

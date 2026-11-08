@@ -195,6 +195,63 @@ class CompanyController extends Controller
     }
 
     /**
+     * List lead categories granted to a company.
+     */
+    public function categories(Request $request, Company $company)
+    {
+        $user = $request->user();
+        if (! $user->isSuperAdmin() && (int) $user->company_id !== (int) $company->id) {
+            abort(403, 'Access denied');
+        }
+
+        $categories = $company->categories()
+            ->orderBy('name')
+            ->get(['categories.id', 'categories.name', 'categories.description']);
+
+        return response()->json($categories);
+    }
+
+    /**
+     * Grant a lead category to a company (super admin only).
+     */
+    public function grantCategoryAccess(Request $request, Company $company)
+    {
+        $user = $request->user();
+        if (! $user->isSuperAdmin()) {
+            abort(403, 'Only super admin can grant category access');
+        }
+
+        $validated = $request->validate([
+            'category_id' => 'required|exists:categories,id',
+        ]);
+
+        $company->categories()->syncWithoutDetaching([(int) $validated['category_id']]);
+
+        return response()->json([
+            'message' => 'Category access granted',
+            'categories' => $company->categories()->orderBy('name')->get(['categories.id', 'categories.name']),
+        ]);
+    }
+
+    /**
+     * Revoke a lead category from a company (super admin only).
+     */
+    public function revokeCategoryAccess(Request $request, Company $company, int $categoryId)
+    {
+        $user = $request->user();
+        if (! $user->isSuperAdmin()) {
+            abort(403, 'Only super admin can revoke category access');
+        }
+
+        $company->categories()->detach($categoryId);
+
+        return response()->json([
+            'message' => 'Category access revoked',
+            'categories' => $company->categories()->orderBy('name')->get(['categories.id', 'categories.name']),
+        ]);
+    }
+
+    /**
      * Grant project access to a company.
      */
     public function grantProjectAccess(Request $request, Company $company)
