@@ -26,6 +26,7 @@ use App\Http\Controllers\Api\CategoryController;
 use App\Http\Controllers\Api\MediaController;
 use App\Http\Controllers\Api\SmsController;
 use App\Http\Controllers\Api\MyPetPlusLeadController;
+use App\Http\Controllers\Api\MyDoctorPlusLeadController;
 use App\Http\Controllers\Api\MyBeautyLeadController;
 use App\Http\Controllers\Api\VistaExpressController;
 use App\Services\VistaExpressService;
@@ -75,6 +76,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/projects/{project}/sso/redirect', [ProjectController::class, 'generateSSORedirect']);
     Route::get('/projects/{project}/iframe-callback', [ProjectController::class, 'iframeCallback']);
     Route::get('/projects/{project}/mypetplus/leads', [MyPetPlusLeadController::class, 'index']);
+    Route::get('/projects/{project}/mydoctorplus/leads', [MyDoctorPlusLeadController::class, 'index']);
     Route::get('/projects/{project}/mybeauty/leads', [MyBeautyLeadController::class, 'index']);
 
     // Vista Express (Opti Amazon) read-only business data, proxied through the

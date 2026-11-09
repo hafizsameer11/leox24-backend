@@ -62,6 +62,17 @@ class ProjectSeeder extends Seeder
                 'is_active' => true,
             ],
             [
+                'name' => 'My Doctor Plus',
+                'slug' => 'mydoctorplus',
+                'description' => 'Healthcare platform — registrations, subscriptions and commercial analytics',
+                'integration_type' => 'api',
+                'api_auth_type' => 'custom',
+                'api_base_url' => 'https://mydoctoradmin.mydoctorplus.it/api',
+                'admin_panel_url' => 'https://mydoctoradmin.mydoctorplus.it',
+                'sso_enabled' => false,
+                'is_active' => true,
+            ],
+            [
                 'name' => 'My Beauty',
                 'slug' => 'mybeauty',
                 'description' => 'Beauty salon marketplace platform',
